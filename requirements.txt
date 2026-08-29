@@ -7,3 +7,5 @@ xgboost
 scikit-learn
 matplotlib
 joblib
+
+pytest
