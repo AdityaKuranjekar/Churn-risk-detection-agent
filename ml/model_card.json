@@ -1,0 +1,109 @@
+{
+  "n_rows": 10000,
+  "n_features": 25,
+  "churn_rate": 0.1021,
+  "split_seed": 42,
+  "params": {
+    "objective": "binary:logistic",
+    "base_score": null,
+    "booster": null,
+    "callbacks": null,
+    "colsample_bylevel": null,
+    "colsample_bynode": null,
+    "colsample_bytree": 0.9,
+    "device": null,
+    "early_stopping_rounds": null,
+    "enable_categorical": true,
+    "eval_metric": "aucpr",
+    "feature_types": null,
+    "feature_weights": null,
+    "gamma": null,
+    "grow_policy": null,
+    "importance_type": null,
+    "interaction_constraints": null,
+    "learning_rate": 0.05,
+    "max_bin": null,
+    "max_cat_threshold": null,
+    "max_cat_to_onehot": null,
+    "max_delta_step": null,
+    "max_depth": 4,
+    "max_leaves": null,
+    "min_child_weight": 2,
+    "missing": NaN,
+    "monotone_constraints": null,
+    "multi_strategy": null,
+    "n_estimators": 300,
+    "n_jobs": -1,
+    "num_parallel_tree": null,
+    "random_state": 42,
+    "reg_alpha": null,
+    "reg_lambda": 1.0,
+    "sampling_method": null,
+    "scale_pos_weight": 8.791921664626683,
+    "subsample": 0.9,
+    "tree_method": null,
+    "validate_parameters": null,
+    "verbosity": null
+  },
+  "cv_auc_mean": 0.6189885791974632,
+  "cv_auc_std": 0.03913626904724213,
+  "test_auc": 0.8808463251670379,
+  "test_pr_auc": 0.6341112339318776,
+  "test_precision_churn": 0.5679611650485437,
+  "test_recall_churn": 0.5735294117647058,
+  "test_f1_churn": 0.570731706817085,
+  "threshold_used": 0.6981725692749023,
+  "confusion_matrix": [
+    [
+      1707,
+      89
+    ],
+    [
+      87,
+      117
+    ]
+  ],
+  "top_10_features": [
+    {
+      "feature": "recent_inactivity_flag",
+      "gain": 0.35871022939682007
+    },
+    {
+      "feature": "last_login_days",
+      "gain": 0.19492273032665253
+    },
+    {
+      "feature": "payment_failures",
+      "gain": 0.05209682136774063
+    },
+    {
+      "feature": "tenure_days",
+      "gain": 0.04121502861380577
+    },
+    {
+      "feature": "usage_per_tenure",
+      "gain": 0.033517442643642426
+    },
+    {
+      "feature": "plan_tier_ord",
+      "gain": 0.02956313267350197
+    },
+    {
+      "feature": "high_support_flag",
+      "gain": 0.029533740133047104
+    },
+    {
+      "feature": "usage_level",
+      "gain": 0.029208391904830933
+    },
+    {
+      "feature": "engagement_score",
+      "gain": 0.02781437337398529
+    },
+    {
+      "feature": "arr_to_usage",
+      "gain": 0.026254652068018913
+    }
+  ],
+  "trained_at": "2026-08-30T01:44:32.006446"
+}
