@@ -90,7 +90,7 @@ def build_features(df):
     corrs = X.corrwith(y).abs().sort_values(ascending=False)
     print(corrs.head(10))
     if corrs.max() > 0.95:
-        print("WARNING: Correlation > 0.95 detected. Potential leakage.")
+        raise ValueError(f"WARNING: Correlation > 0.95 detected. Potential leakage! Max is {corrs.index[0]}={corrs.max():.3f}")
         
     return X, y, feat_cols, pre
 
@@ -180,6 +180,17 @@ def train_eval(X, y, feat_cols, run_grid=False):
     recall_churn = float(recalls[best_f1_idx])
     f1_churn = float(f1s[best_f1_idx])
     
+    # Baselines
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.impute import SimpleImputer
+    imp = SimpleImputer(strategy='median')
+    X_train_imp = imp.fit_transform(X_train)
+    X_test_imp = imp.transform(X_test)
+    lr = LogisticRegression(class_weight="balanced", max_iter=1000, random_state=seed)
+    lr.fit(X_train_imp, y_train)
+    lr_proba = lr.predict_proba(X_test_imp)[:, 1]
+    baseline_lr_auc = roc_auc_score(y_test, lr_proba)
+
     metrics = {
         "n_rows": len(X),
         "n_features": len(feat_cols),
@@ -194,7 +205,10 @@ def train_eval(X, y, feat_cols, run_grid=False):
         "test_recall_churn": recall_churn,
         "test_f1_churn": f1_churn,
         "threshold_used": threshold_used,
-        "confusion_matrix": cm.tolist()
+        "confusion_matrix": cm.tolist(),
+        "baseline_majority_accuracy": float(1 - y_test.mean()),
+        "baseline_majority_recall": 0.0,
+        "baseline_lr_auc": float(baseline_lr_auc)
     }
     
     return best_model, metrics
@@ -239,14 +253,59 @@ def persist(model, feat_cols, pre, metrics):
         
     print(f"Persisted models and metrics to disk.")
 
-def self_check(X_test, feat_cols):
+def self_check(X_test, feat_cols, metrics):
     print("\n--- SELF-CHECK ---")
     model = joblib.load("churn_model.pkl")
     fc = joblib.load("feature_columns.pkl")
+    pre = joblib.load("preprocess.pkl")
     
     errors = []
     if len(fc) != X_test.shape[1]:
         errors.append("Feature columns length mismatch.")
+        
+    def predict_dict(d):
+        from features import derive_features
+        df_derived = derive_features(d, pre)
+        # Apply same mock dummy / region encoding
+        if "gender" in df_derived.columns:
+            for g in ["Male", "Female", "Other"]:
+                df_derived[f"gender_{g}"] = (df_derived["gender"] == g).astype(int)
+            df_derived["gender_nan"] = 0
+            df_derived = df_derived.drop("gender", axis=1)
+        if "region" in df_derived.columns:
+            df_derived["region"] = df_derived["region"].map(pre["region_encoding"]).fillna(0)
+        missing = [c for c in fc if c not in df_derived.columns]
+        for c in missing: df_derived[c] = pre["medians"].get(c, 0)
+        X_df = df_derived[fc].apply(pd.to_numeric, errors="coerce").fillna(pre["medians"])
+        return model.predict_proba(X_df)[0, 1]
+
+    # Hand-built dicts
+    h_row = {"tenure_days": 1000, "engagement_score": 90, "payment_failures": 0, "last_login_days": 1, "support_contacts": 0, "usage_level": 1000, "monthly_charges": 10, "num_devices": 1}
+    m_row = {"tenure_days": 180, "engagement_score": 50, "payment_failures": 1, "last_login_days": 14, "support_contacts": 1, "usage_level": 100, "monthly_charges": 50, "num_devices": 2}
+    c_row = {"tenure_days": 30, "engagement_score": 10, "payment_failures": 3, "last_login_days": 40, "support_contacts": 5, "usage_level": 10, "monthly_charges": 100, "num_devices": 5}
+    
+    try:
+        p_h = predict_dict(h_row)
+        p_m = predict_dict(m_row)
+        p_c = predict_dict(c_row)
+        print(f"Monotonic check: p(healthy)={p_h:.3f}, p(mid)={p_m:.3f}, p(critical)={p_c:.3f}")
+        if not (p_h < p_m < p_c):
+            errors.append(f"Monotonic sanity failed! h={p_h:.3f} m={p_m:.3f} c={p_c:.3f}")
+    except Exception as e:
+        errors.append(f"predict_dict crashed on hand-built dicts: {e}")
+
+    # Missing keys impute path
+    try:
+        p_miss = predict_dict({"tenure_days": 10}) 
+        if not (0 <= p_miss <= 1): errors.append("Missing keys out of bounds")
+        else: print("Missing-key impute path works.")
+    except Exception as e:
+        errors.append(f"Missing keys impute crashed: {e}")
+        
+    if metrics["test_auc"] < 0.75:
+        errors.append(f"test_auc {metrics['test_auc']:.3f} < 0.75")
+    if metrics["test_recall_churn"] < 0.40:
+        errors.append(f"test_recall_churn {metrics['test_recall_churn']:.3f} < 0.40")
         
     if len(errors) == 0:
         print("READY FOR STEP 3")
@@ -283,7 +342,7 @@ def main():
     
     if not args.no_save:
         persist(model, feat_cols, pre, metrics)
-        self_check(X, feat_cols)
+        self_check(X, feat_cols, metrics)
 
 if __name__ == "__main__":
     main()

@@ -63,6 +63,9 @@
       117
     ]
   ],
+  "baseline_majority_accuracy": 0.898,
+  "baseline_majority_recall": 0.0,
+  "baseline_lr_auc": 0.8825822088300799,
   "top_10_features": [
     {
       "feature": "recent_inactivity_flag",
@@ -105,5 +108,5 @@
       "gain": 0.026254652068018913
     }
   ],
-  "trained_at": "2026-08-30T01:44:32.006446"
+  "trained_at": "2026-08-30T01:48:33.210043"
 }
