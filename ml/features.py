@@ -22,6 +22,8 @@ def derive_features(df_or_dict, preprocess_stats=None):
         if "region" in df_or_dict: r["region"] = df_or_dict["region"]
         if "gender" in df_or_dict: r["gender"] = df_or_dict["gender"]
         df = pd.DataFrame([r])
+        for c in BASE_COLS:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
     else:
         df = df_or_dict.copy()
 

@@ -9,3 +9,5 @@ matplotlib
 joblib
 
 pytest
+
+shap
