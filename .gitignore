@@ -5,4 +5,5 @@ __pycache__/
 *.pyd
 .pytest_cache/
 *.db
-data/
+data/customer_churn_raw.csv
+data/playbook_embeddings.ollama.pkl

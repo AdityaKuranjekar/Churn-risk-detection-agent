@@ -1,0 +1,92 @@
+[
+  {
+    "id": "pb_billing_failures",
+    "title": "Repeated payment failures",
+    "tags": ["billing", "payment failures", "involuntary churn", "P0"],
+    "applies_when": "2+ failed payments in the last 90 days",
+    "text": "For customers with two or more payment failures in the last 90 days, treat this as involuntary churn risk first. Reach out on a call (not email) within 24 hours to fix the payment method, and offer a one-month credit or discount as goodwill. Do NOT lead with content or engagement messaging until billing is resolved.",
+    "recommended_action": "billing_fix_outreach",
+    "channel": "call"
+  },
+  {
+    "id": "pb_support_overload",
+    "title": "High support volume or unresolved tickets",
+    "tags": ["support", "tickets", "complaints", "escalation", "P0"],
+    "applies_when": "High contact volume and unresolved tickets",
+    "text": "If a customer has a spike in support contacts or multiple unresolved open tickets, they are highly frustrated. Escalate immediately to a live support callback. An assigned support engineer or CSM should call them within 24 hours to directly troubleshoot. Suspend automated marketing emails during this period.",
+    "recommended_action": "live_support_callback",
+    "channel": "call"
+  },
+  {
+    "id": "pb_high_value_winback",
+    "title": "High-value account win-back",
+    "tags": ["arr", "high-value", "win-back", "premium", "P0"],
+    "applies_when": "High churn probability for a high-ARR customer",
+    "text": "High-value accounts displaying extreme churn signals require white-glove intervention. A senior CSM or account executive must initiate a personal touchpoint within 48 hours to assess the relationship. Prepare a custom executive business review (EBR) highlighting past ROI and propose tailored strategic adjustments.",
+    "recommended_action": "win_back_high_value",
+    "channel": "csm_touch"
+  },
+  {
+    "id": "pb_renewal_downgrade",
+    "title": "Pre-renewal downgrade option",
+    "tags": ["renewal", "downgrade", "low engagement", "P1"],
+    "applies_when": "Approaching renewal with very low engagement",
+    "text": "When a customer is within 45 days of renewal but has persistently low engagement, a full-price renewal is unlikely. Send a targeted email offering a downgrade to a lower tier or a flexible pricing option. Retaining partial revenue is preferable to losing the account entirely.",
+    "recommended_action": "renewal_downgrade_offer",
+    "channel": "email"
+  },
+  {
+    "id": "pb_declining_usage_no_complaints",
+    "title": "Re-engagement for silent drop-offs",
+    "tags": ["usage", "declining", "content", "re-engagement", "P2"],
+    "applies_when": "Declining usage but no complaints logged",
+    "text": "For customers exhibiting a silent drop in usage without filing support complaints, send a curated value re-engagement email. Highlight new content, features, or use cases aligned with their historical preferences. The goal is to remind them of the platform's core value without being overly aggressive.",
+    "recommended_action": "reengagement_content_email",
+    "channel": "email"
+  },
+  {
+    "id": "pb_low_feature_adoption",
+    "title": "Feature adoption nudge",
+    "tags": ["engagement", "adoption", "features", "P2"],
+    "applies_when": "Moderate engagement but active recent logins",
+    "text": "Customers who log in frequently but only utilize basic functionality have a high risk of long-term stagnation. Trigger an in-app feature adoption nudge accompanied by a brief educational email. Highlight one advanced feature they haven't tried, emphasizing how it saves time or improves outcomes.",
+    "recommended_action": "feature_adoption_nudge",
+    "channel": "in_app"
+  },
+  {
+    "id": "pb_generic_csm_checkin",
+    "title": "Routine at-risk CSM check-in",
+    "tags": ["at-risk", "check-in", "csm", "P1"],
+    "applies_when": "General elevated churn probability without a specific trigger",
+    "text": "When a customer crosses the churn risk threshold without a clear overriding factor like billing or support, a standard CSM check-in is required. Reach out to schedule a brief 15-minute sync to discuss their current goals and any friction points they might be experiencing.",
+    "recommended_action": "csm_personal_checkin",
+    "channel": "csm_touch"
+  },
+  {
+    "id": "pb_healthy_monitor",
+    "title": "Healthy account monitoring",
+    "tags": ["healthy", "monitor", "routine", "P3"],
+    "applies_when": "Customer is healthy and low-risk",
+    "text": "This customer is currently healthy and exhibiting strong retention signals. No direct intervention is needed at this time. Continue routine monitoring and standard lifecycle marketing. Look for opportunities to turn them into an advocate or request a review if sentiment remains highly positive.",
+    "recommended_action": "monitor",
+    "channel": "none"
+  },
+  {
+    "id": "pb_negative_sentiment_spike",
+    "title": "Negative sentiment spike response",
+    "tags": ["sentiment", "feedback", "nps", "negative", "P1"],
+    "applies_when": "Recent feedback or NPS score is sharply negative",
+    "text": "A sudden drop in feedback sentiment or a detractor NPS score is a strong leading indicator of churn. A CSM must follow up personally within 72 hours to acknowledge the feedback, apologize for the friction, and outline specific steps being taken to address their concerns.",
+    "recommended_action": "csm_personal_checkin",
+    "channel": "csm_touch"
+  },
+  {
+    "id": "pb_new_customer_onboarding_gap",
+    "title": "Onboarding usage gap",
+    "tags": ["onboarding", "new customer", "early usage", "P2"],
+    "applies_when": "Short tenure with low early usage",
+    "text": "New customers failing to establish a usage habit within their first 60 days require immediate course correction. Send an onboarding re-engagement sequence focusing on the single most critical 'aha moment' feature to build momentum before they churn early.",
+    "recommended_action": "reengagement_content_email",
+    "channel": "email"
+  }
+]
