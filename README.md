@@ -111,7 +111,7 @@ GEMINI_API_KEY=your_gemini_api_key_here
 SECRET_KEY=your-secret-key
 CORS_ORIGINS=*
 FRONTEND_DIR=frontend
-EMBEDDING_BACKEND=ollama          # or "gemini" for cloud deploy
+EMBED_BACKEND=ollama          # or "gemini" for cloud deploy
 OLLAMA_MODEL=nomic-embed-text
 OLLAMA_BASE_URL=http://localhost:11434
 ```
