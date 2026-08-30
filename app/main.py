@@ -18,7 +18,7 @@ async def lifespan(app: FastAPI):
             logging.info("Database is empty. Running load_dataset...")
             try:
                 import load_dataset
-                load_dataset.main()
+                load_dataset.main([])
             except Exception as e:
                 logging.error("Failed to load dataset: %s", e)
 

@@ -534,12 +534,12 @@ def validate():
 # -----------------------------------------------------------------------------
 # MAIN
 # -----------------------------------------------------------------------------
-def main():
+def main(args_list=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--inspect", action="store_true")
     parser.add_argument("--validate", action="store_true")
     parser.add_argument("--rebuild", action="store_true")
-    args = parser.parse_args()
+    args = parser.parse_args(args_list)
     
     load_dotenv()
     demo_size = int(os.environ.get("DEMO_SUBSET_SIZE", DEMO_SUBSET_SIZE))
