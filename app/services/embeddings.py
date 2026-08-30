@@ -5,7 +5,7 @@ import httpx
 class EmbeddingUnavailable(Exception):
     pass
 
-EMBED_BACKEND = os.getenv("EMBED_BACKEND", "ollama").lower()
+EMBED_BACKEND = os.getenv("EMBED_BACKEND", os.getenv("EMBEDDING_BACKEND", "ollama")).lower()
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_EMBED_MODEL", "nomic-embed-text")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
