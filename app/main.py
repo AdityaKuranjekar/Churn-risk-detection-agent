@@ -8,8 +8,20 @@ from fastapi.staticfiles import StaticFiles
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logging.basicConfig(level=logging.INFO)
-    from app.db import Base, engine
+    from app.db import Base, engine, SessionLocal
     Base.metadata.create_all(bind=engine)
+    
+    # Auto-seed database if empty (useful for Render ephemeral storage)
+    from app.models import Customer
+    with SessionLocal() as session:
+        if session.query(Customer).count() == 0:
+            logging.info("Database is empty. Running load_dataset...")
+            try:
+                import load_dataset
+                load_dataset.main()
+            except Exception as e:
+                logging.error("Failed to load dataset: %s", e)
+
     try:
         from app.services import rag
         rag.warm()
