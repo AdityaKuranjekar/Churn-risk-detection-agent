@@ -9,7 +9,7 @@ EMBED_BACKEND = os.getenv("EMBED_BACKEND", os.getenv("EMBEDDING_BACKEND", "ollam
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_EMBED_MODEL", "nomic-embed-text")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-GEMINI_EMBED_MODEL = os.getenv("GEMINI_EMBED_MODEL", "models/text-embedding-004")
+GEMINI_EMBED_MODEL = os.getenv("GEMINI_EMBED_MODEL", "models/gemini-embedding-2")
 EMBED_DIM_EXPECTED = 768
 
 def backend_info() -> dict:
@@ -45,7 +45,8 @@ def _embed_gemini(text: str, kind: str) -> list:
         resp = genai.embed_content(
             model=GEMINI_EMBED_MODEL,
             content=text,
-            task_type=task_type
+            task_type=task_type,
+            output_dimensionality=EMBED_DIM_EXPECTED
         )
         return resp["embedding"]
     except Exception as e:
