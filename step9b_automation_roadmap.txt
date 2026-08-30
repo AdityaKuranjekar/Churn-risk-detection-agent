@@ -1,0 +1,324 @@
+===============================================================================
+STEP 9b — "AUTOMATION ROADMAP" BUTTON  (n8n orchestration blueprint)
+Files:  frontend/index.html   (new button + modal + inline-SVG diagrams)
+        docs/n8n_workflow.md   (mermaid versions — for README + slides)
+Churn Risk Agent  ·  detailed end-to-end implementation plan
+===============================================================================
+
+WHAT THIS IS (and is NOT)
+-------------------------
+IS:  a polished, presentation-grade panel that shows how the agent becomes a
+     fully automated, event-driven Customer-Success system with n8n as the
+     orchestration layer. It communicates "the production design is worked
+     out; we are ready to build all of it."
+IS NOT: a live n8n instance, a webhook, or any backend change. The current
+     build's app/services/orchestrator.py already performs this exact
+     sequence in-process — the roadmap panel says so, honestly, in Section 6.
+
+FRAMING FOR JUDGES (put this sentence in the modal footer):
+  "Everything in this blueprint runs today as an in-process Python pipeline
+   (orchestrator.py). n8n adds scheduling, event triggers, retries,
+   integrations (Slack / email / CRM), and a visual operations canvas —
+   without moving business logic out of the backend."
+
+
+-------------------------------------------------------------------------------
+PART A — THE BUTTON
+-------------------------------------------------------------------------------
+Top bar, right side, next to "How it works":
+    <button> "Automation roadmap" </button>   (ghost style, --accent-text,
+    --fs-13). Optional small node-graph line-icon (inline SVG) before the text.
+
+Opens the SAME modal shell built for "How it works" (role="dialog", aria-modal,
+focus-trap, Esc, return focus). Title: "Automation roadmap — n8n orchestration".
+Reuse the modal's tab strip pattern.
+
+Tabs:
+  [ Architecture ] [ Daily workflow ] [ Event-driven ] [ Agent brain ]
+  [ Who does what ] [ Live vs roadmap ]
+
+Modal max-width 920px (wider than How-it-works — diagrams need room).
+Each tab body: a scrollable container (overflow-x:auto) so wide SVG diagrams
+never break the page layout on narrow screens.
+
+
+-------------------------------------------------------------------------------
+PART B — SHARED DIAGRAM PRIMITIVES (build once, reuse in every tab)
+-------------------------------------------------------------------------------
+All diagrams are INLINE SVG. No libraries, no CDN. Use the design tokens.
+
+B1. Palette (from PART B of step9_frontend.txt):
+    node fill        #ffffff
+    node stroke      var(--border-2) #d0d5dd, 1px
+    node title text  var(--text) 12px 600
+    node sub text    var(--text-3) 11px
+    connector stroke var(--border-2), 1.5px
+    arrowhead        var(--text-3)
+    accent node      fill var(--accent-weak), stroke var(--accent)
+    branch/decision  diamond, stroke var(--high) #dc6803
+    "n8n" group box  dashed stroke var(--accent), fill var(--accent-weak) 40%
+
+B2. <defs> arrowhead marker (put once per svg):
+    <marker id="arw" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7"
+      markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="var(--text-3)"/>
+    </marker>
+    connectors: <path ... marker-end="url(#arw)"/>
+
+B3. node(x,y,w,h,title,sub,variant) -> returns an SVG <g> string:
+    rounded rect (rx=8) + title text + optional sub text (wrap at ~22 chars).
+    variants: "default" | "accent" | "io" (dotted stroke).
+
+B4. Flow animation (cosmetic): 2 small circles (r=2.5, fill var(--accent))
+    travelling along each main connector via CSS:
+      @keyframes flow { from{offset-distance:0%} to{offset-distance:100%} }
+      .flow-dot{ offset-path: path("<same d as the connector>");
+                 animation: flow 1.8s linear infinite; }
+    Stagger the second dot with animation-delay:.9s.
+    prefers-reduced-motion: reduce  -> hide .flow-dot entirely.
+
+B5. On tab open: fade+slide nodes in with a ~120ms stagger (JS adds .in;
+    CSS transitions transform/opacity). Reduced-motion -> show immediately.
+
+B6. Responsive: diagrams are fixed-width SVG (e.g. viewBox 0 0 860 520) inside
+    an overflow-x:auto div. Do NOT try to reflow the graph; horizontal scroll
+    on small screens is fine and expected for an architecture diagram.
+
+
+-------------------------------------------------------------------------------
+PART C — TAB 1: ARCHITECTURE  ("where n8n fits")
+-------------------------------------------------------------------------------
+Vertical flow, top to bottom. Exact nodes + copy:
+
+  [React SPA]                         (default)
+      |
+  [FastAPI]  "application APIs · business rules · auth · persistence"
+      |  (fans out to 3)
+  ┌───────────────┬───────────────┬────────────────────────────┐
+  [PostgreSQL +   [XGBoost model  [n8n orchestration           (accent)
+   pgvector]       churn P + SHAP]  scheduling · triggers ·
+  "source of                        AI workflow · integrations]
+   truth"
+                                        |  (n8n fans out to 3)
+                          ┌─────────────┼──────────────┐
+                          [LLM          [RAG playbook   [Automation
+                           reasoning &   retrieval]      Slack · email ·
+                           personalize]                  CRM · tasks]
+                          └─────────────┼──────────────┘
+                                        |
+                              [Recommendations] -> [FastAPI] -> [React]
+
+Wrap the n8n node + its 3 children + Recommendations in the dashed "n8n"
+group box. Caption under diagram (--fs-12 --text-3):
+  "n8n owns orchestration and the outside world. The backend keeps data,
+   rules, ML, and auth. Clean separation — easy to reason about, easy to
+   scale."
+
+
+-------------------------------------------------------------------------------
+PART D — TAB 2: DAILY WORKFLOW  (scheduled, the headline n8n canvas)
+-------------------------------------------------------------------------------
+Single vertical chain of n8n nodes (this is what you'd literally show on the
+n8n canvas in a live demo). Each node: title (600) + tiny "n8n node type"
+sub in --text-3. Copy exactly:
+
+  1  Schedule Trigger        sub: "Cron · every day 06:00"
+  2  Fetch usage             sub: "HTTP Request → /internal/usage"
+  3  Fetch support tickets   sub: "HTTP Request → /internal/support"
+  4  Fetch latest feedback   sub: "HTTP Request → /internal/feedback"
+  5  Aggregate signals       sub: "Function · 30/90-day windows"
+  6  Health score            sub: "HTTP → /risk/breakdown (rule engine)"
+  7  Churn probability       sub: "HTTP → /ml/predict (XGBoost)"
+  8  IF  risk gate           sub: "churn ≥ 0.50 OR band ∈ at-risk/critical"
+       ├── FALSE → [Log: monitor]              (short branch, --text-3)
+       └── TRUE  ↓
+  9  LLM · analyze why       sub: "AI node · grounded in signals"
+  10 Retrieve playbook (RAG) sub: "Vector search · top-1 of 10 playbooks"
+  11 LLM · next-best-action  sub: "AI node · action constrained by rules"
+  12 Generate CSM message    sub: "AI node · personalized draft"
+  13 Store recommendation    sub: "HTTP → /analyses (Postgres)"
+  14 Notify CSM              sub: "Slack / Email · with Approve link"
+
+Render node 8 as a diamond; nodes 9-12 grouped with a faint "AI" band label.
+Caption: "Same steps as orchestrator.analyze_customer() today — n8n adds the
+schedule, the fan-in fetches, retries, and the CSM notification."
+
+
+-------------------------------------------------------------------------------
+PART E — TAB 3: EVENT-DRIVEN  (reactive automation)
+-------------------------------------------------------------------------------
+Short vertical flow, exact copy:
+
+  [Webhook Trigger]   sub: "Customer feedback / NPS submitted"
+      ↓
+  [Sentiment analysis]  sub: "AI node"
+      ↓
+  <IF sentiment negative?>   (diamond)
+      ├── NO  → [End · store only]
+      └── YES ↓
+  [Look up account risk]  sub: "HTTP → /customers/{id}"
+      ↓
+  <IF churn ≥ 0.70?>   (diamond)
+      ├── NO  → [Queue for daily run]
+      └── YES ↓
+  [Escalate to CSM]  sub: "Slack DM · P0"
+      ↓
+  [Draft recommended response]  sub: "AI node"
+
+Caption: "The nightly batch catches slow decline. Event triggers catch the
+sudden 'your update broke my reports' moment — the system reacts in seconds,
+not hours."
+
+
+-------------------------------------------------------------------------------
+PART F — TAB 4: AGENT BRAIN  (multi-agent decomposition)
+-------------------------------------------------------------------------------
+Top: a fan diagram —
+        [n8n]
+      /   |   \
+ [Signal] [Risk] [Insight]   agents  (default nodes)
+      \   |   /
+     [Action agent]
+          ↓
+   [Communication agent]
+
+Below the diagram, two small side-by-side "sample I/O" cards (monospace,
+--fs-12, --surface panel):
+
+  SIGNAL AGENT
+  in  { "login_change": -42, "ticket_count": 4, "nps_change": -6 }
+  out { "signals": ["Significant usage decline","Support backlog",
+                    "Negative customer sentiment"] }
+
+  ACTION AGENT
+  out { "action": "Executive health review", "priority": "P0",
+        "reason": "High-value account with declining engagement" }
+
+Caption: "Each agent is one focused prompt with structured output. n8n wires
+them; the backend still owns the deterministic risk math and the action
+catalog that constrains the Action agent."
+
+
+-------------------------------------------------------------------------------
+PART G — TAB 5: WHO DOES WHAT  (responsibility split table)
+-------------------------------------------------------------------------------
+Simple 2-col table, hairline rows, --fs-13:
+
+  React        User experience
+  FastAPI      Application APIs, business rules, persistence, auth
+  PostgreSQL   Source of truth (+ pgvector for playbook embeddings)
+  XGBoost      Churn probability & feature attribution (SHAP)
+  n8n          Orchestration, schedules, event triggers, AI workflow,
+               external integrations, retries, observability
+  LLM (Gemini) Reasoning, root-cause explanation, message personalization
+
+Caption: "n8n for triggers → orchestration → AI steps → integrations →
+actions. Backend for data → APIs → rules → persistence → auth. Keeping the
+line clear is what makes the architecture mature — not pushing everything
+into workflow nodes."
+
+Also list, as a short "n8n anti-patterns we avoid" note (--text-3):
+  "Not doing: health-score math across 15 nodes · React calling n8n for every
+   click · 10 LLM calls where 2 suffice."
+
+
+-------------------------------------------------------------------------------
+PART H — TAB 6: LIVE VS ROADMAP  (the honesty slide — judges love this)
+-------------------------------------------------------------------------------
+Two columns:
+
+  LIVE IN THIS BUILD                    WITH n8n (production)
+  ─────────────────────                 ─────────────────────
+  orchestrator.analyze_customer()       Same steps as a visual n8n workflow
+  runs on the Analyze click             Scheduled nightly for all accounts
+  Rule engine + XGBoost + RAG + LLM     unchanged (called via HTTP nodes)
+  SQLite                                PostgreSQL + pgvector
+  In-memory cosine over 10 playbooks    pgvector similarity search
+  CSM approves in the UI                + Slack/email notify with deep link
+  Manual re-analyze                     Event triggers (negative feedback,
+                                        payment failure, usage cliff)
+  —                                     Retries, dead-letter, run history,
+                                        outcome logging & feedback loop
+
+Caption: "Nothing is faked. The pipeline is real and running now. n8n is the
+delivery layer: scheduling, events, integrations, and an ops canvas."
+
+
+-------------------------------------------------------------------------------
+PART I — docs/n8n_workflow.md  (mermaid — renders on GitHub, reuse in slides)
+-------------------------------------------------------------------------------
+Create this file with 4 mermaid diagrams (```mermaid fenced):
+  1. flowchart TD — architecture (Tab 1)
+  2. flowchart TD — daily workflow with the IF branch (Tab 2)
+  3. flowchart TD — event-driven trigger (Tab 3)
+  4. flowchart TD — agent brain fan (Tab 4)
+Plus the responsibility table (Tab 5) as a markdown table and the Live-vs-
+Roadmap table (Tab 6). Keep node labels identical to the in-app copy so the
+demo, the repo, and the slides all match.
+Link this file from README.md ("## Roadmap: n8n automation").
+
+
+-------------------------------------------------------------------------------
+PART J — DEMO SCRIPT HOOK  (for Step 10)
+-------------------------------------------------------------------------------
+~15s beat, right after the live Analyze result appears:
+  "The analysis you just saw runs as one Python pipeline today. Here's how it
+   deploys — [open Automation roadmap → Daily workflow tab] — the same steps
+   as a scheduled n8n workflow: nightly for every account, plus event
+   triggers when feedback turns negative, and it notifies the CSM in Slack
+   with an approve link. The logic stays in the backend; n8n orchestrates."
+Then close the modal and finish in the UI (approve → "sent").
+
+
+-------------------------------------------------------------------------------
+PART K — QA CHECKLIST
+-------------------------------------------------------------------------------
+  [ ] "Automation roadmap" button in top bar; opens modal on Architecture tab
+  [ ] all 6 tabs render; SVG diagrams crisp, arrowheads show, no clipping
+  [ ] wide diagrams scroll horizontally inside their container; page body
+      never gets a horizontal scrollbar
+  [ ] flow dots animate along connectors; prefers-reduced-motion disables
+      them and shows all nodes immediately (no stagger)
+  [ ] Esc closes; focus returns to the button; Tab cycles within modal
+  [ ] modal is readable at 1280px and at ~700px (diagram scrolls)
+  [ ] copy matches docs/n8n_workflow.md exactly
+  [ ] docs/n8n_workflow.md mermaid renders on GitHub (push + check)
+  [ ] no console errors; no external network requests from the modal
+  [ ] light theme only is fine (app is light); colors use tokens, not hex
+
+
+-------------------------------------------------------------------------------
+PART L — DELIVERABLES CHECKLIST
+-------------------------------------------------------------------------------
+  [ ] frontend/index.html:
+        - "Automation roadmap" top-bar button
+        - modal reusing the How-it-works shell, 6 tabs
+        - shared SVG primitives: node(), arrowhead marker, flow-dot keyframe,
+          stagger-in
+        - Tab 1 Architecture, Tab 2 Daily workflow (diamond IF), Tab 3
+          Event-driven, Tab 4 Agent brain + sample I/O cards, Tab 5
+          responsibility table + anti-patterns, Tab 6 Live-vs-roadmap
+        - footer framing sentence
+  [ ] docs/n8n_workflow.md (4 mermaid diagrams + 2 tables), linked from README
+  [ ] QA checklist (PART K) ticked
+  [ ] screenshot of Tab 2 (daily workflow) captured for slides / LinkedIn
+  [ ] commit frontend/ + docs/ + README link
+
+TIME BUDGET: ~60-75 min
+  (15 modal shell reuse + tabs, 30 six SVG diagrams, 10 mermaid doc,
+   10 QA + screenshots)
+
+WATCH-OUTS
+  - This is a blueprint panel. Do NOT add a real webhook / n8n dependency /
+    backend route. No new env vars.
+  - Keep every node label identical across the modal, the mermaid doc, and
+    the spoken demo — consistency reads as competence.
+  - Section H (Live vs roadmap) must stay honest: it is the credibility
+    anchor. Never imply n8n is running if it isn't.
+  - Diagrams: fixed-size SVG + overflow-x:auto wrapper. Do not attempt a
+    responsive auto-layout graph — wasted time, worse result.
+  - Reuse the How-it-works modal component; don't build a second modal system.
+NEXT: Step 10 — end-to-end pass + 3-min demo script (now including the
+      Automation roadmap beat), then Step 11 (auth + HF Spaces), Step 12
+      LinkedIn.
+===============================================================================

@@ -1,0 +1,438 @@
+===============================================================================
+STEP 3 — DETERMINISTIC SCORING + ACTION CATALOG
+Files:  app/services/scoring.py   app/services/action_catalog.py
+Churn Risk Agent  ·  detailed end-to-end implementation plan
+===============================================================================
+
+GOAL
+----
+Two small, pure, dependency-free modules that run ALONGSIDE the ML model:
+
+  scoring.py         risk_breakdown(signals) -> explainable 0-100 health score
+                     + signed factor contributions ("why")
+  action_catalog.py  pick_base_action(signals, churn_prob) -> (action, priority)
+                     the CONSTRAINED action the LLM must elaborate (never invent)
+
+WHY THIS EXISTS (the "two numbers, two methods" story)
+  - ML model (Step 2) gives P(churn) = a ranked probability, hard to explain.
+  - scoring.py gives a transparent, auditable score a CSM can defend in a QBR:
+      "Health 39/100 because: usage -18, support -14, payments -12, ..."
+  - The UI shows BOTH side by side. They should usually AGREE in direction;
+    when they disagree that's itself a useful signal (surface it).
+
+DESIGN PRINCIPLES
+  - Pure functions. No DB, no network, no LLM, no randomness. Same input ->
+    same output, forever. Fully unit-testable.
+  - Deterministic and INSPECTABLE: every number traceable to a constant + a
+    formula. No ML here.
+  - Weights/thresholds live in ONE constants block at top of each file so
+    tuning is a 1-line change and can be shown on a slide.
+  - Independent of Step 2: do NOT import the model. If ml/features.py helpers
+    are handy for normalization, fine to reuse, but no model calls.
+
+
+-------------------------------------------------------------------------------
+INPUT CONTRACT — the `signals` dict
+-------------------------------------------------------------------------------
+Assembled by Step 7 orchestrator's get_signals(customer_id) from the DB
+(customers row + aggregates over usage_daily / feedback). scoring.py and
+action_catalog.py must tolerate missing keys (use .get with sane defaults).
+
+signals = {
+  # identity / context (not scored, used for messaging later)
+  "customer_id": int,
+  "name": str,
+  "plan_tier": "Basic"|"Standard"|"Premium",
+  "plan_tier_ord": 0|1|2,
+  "tenure_days": int,
+  "arr": float,
+  "monthly_charges": float,
+  "renewal_date": "YYYY-MM-DD",
+  "num_devices": int,
+
+  # behavioral / account-health signals (THESE get scored)
+  "usage_level": float,            # current-period usage (mins or sessions)
+  "usage_trend_pct": float,       # % change recent vs baseline, e.g. -0.42
+                                   #   (orchestrator computes from usage_daily;
+                                   #    if unavailable -> 0.0, and scoring must
+                                   #    not over-penalize a missing trend)
+  "last_login_days": int,         # days since last login
+  "logins_last_30": int,
+  "active_days_last_30": int,
+  "payment_failures": int,        # last 90d
+  "support_contacts": int,        # last 90d
+  "open_tickets": int,
+  "complaint_count": int,         # feedback rows with is_complaint=1
+  "avg_sentiment": float,         # mean feedback.sentiment in [-1,1]; None if
+                                   #   no feedback -> treat as neutral 0.0
+  "nps_last": int|None,           # -100..100 style or 0..10; document which
+  "engagement_score": float,     # 0-100 from Step 1
+  "days_to_renewal": int,        # derived from renewal_date - today
+}
+
+NOTE: avg_sentiment / feedback aggregates ARE allowed here (unlike Step 2,
+where they were leakage). This module is not trained on churn_label; it is a
+hand-built heuristic, so using sentiment as an input is legitimate.
+
+
+-------------------------------------------------------------------------------
+OUTPUT CONTRACT
+-------------------------------------------------------------------------------
+risk_breakdown(signals) -> dict:
+{
+  "health_score": int,            # 0-100, higher = healthier
+  "risk_band": "healthy"|"watch"|"at_risk"|"critical",
+  "contributors": [               # sorted MOST NEGATIVE first
+    {
+      "factor": "usage",          # one of the FACTOR keys below
+      "label": "Declining usage", # human string for UI
+      "impact": -18.0,            # signed points applied to the 100 baseline
+      "detail": "Usage down 42% vs baseline; 21 days since last login",
+      "severity": "high"|"medium"|"low"|"positive"
+    }, ...
+  ],
+  "positives": [ {factor,label,impact(+),detail}, ... ],  # protective factors
+  "summary_line": "Health 39/100 - driven by declining usage and support load",
+  "as_of": "YYYY-MM-DD"
+}
+
+pick_base_action(signals, churn_prob) -> dict:
+{
+  "action": "billing_fix_outreach",     # stable enum key (see catalog)
+  "action_label": "Billing fix outreach + retention offer",
+  "priority": "P0"|"P1"|"P2"|"P3",
+  "rationale": "2+ payment failures in last 90 days",
+  "matched_rule": "payment_failures>=2",
+  "channel": "email"|"call"|"in_app"|"csm_touch",
+  "playbook_query": "premium customer, repeated payment failures, ...",
+                                        # <- Step 4 RAG uses this verbatim
+  "sla_hours": 24,
+  "fallback_actions": ["curated_content_email"]   # if top action not viable
+}
+
+
+-------------------------------------------------------------------------------
+PART A — scoring.py
+-------------------------------------------------------------------------------
+
+A0. CONSTANTS BLOCK (top of file)
+    BASELINE = 100
+    FACTOR_WEIGHTS = {          # max negative points each factor can remove
+        "usage":          25,
+        "engagement":     15,
+        "support":        20,
+        "sentiment":      15,
+        "payments":       20,
+        "tenure_renewal": 10,
+        "login_recency":  15,
+    }
+    # bands on final health_score
+    BANDS = [(80, "healthy"), (60, "watch"), (40, "at_risk"), (0, "critical")]
+    # sub-thresholds
+    USAGE_DROP_HIGH = -0.40      # >=40% drop -> full usage penalty
+    USAGE_DROP_MED  = -0.20
+    INACTIVE_HIGH_DAYS = 30
+    INACTIVE_MED_DAYS  = 14
+    SUPPORT_HIGH = 3            # contacts in 90d
+    SUPPORT_MED  = 1
+    SENTIMENT_BAD = -0.30
+    RENEWAL_SOON_DAYS = 45
+
+A1. Each factor is a small pure sub-function returning (impact, detail, severity)
+    impact is <= 0 for risk factors, but a factor MAY return a small positive
+    (protective) value when the signal is strongly good.
+
+    score_usage(signals):
+        t = signals.get("usage_trend_pct", 0.0)
+        w = FACTOR_WEIGHTS["usage"]
+        if t <= USAGE_DROP_HIGH:   frac = 1.0
+        elif t <= USAGE_DROP_MED:  frac = 0.6
+        elif t < 0:                frac = 0.3
+        elif t > 0.15:             return (+4, "Usage growing", "positive")
+        else:                      frac = 0.0
+        impact = -round(w * frac, 1)
+        detail = f"Usage {t:+.0%} vs baseline"
+        sev = "high" if frac>=0.8 else "medium" if frac>=0.4 else "low"
+        return (impact, detail, sev)
+
+    score_login_recency(signals):
+        d = signals.get("last_login_days", 0)
+        w = FACTOR_WEIGHTS["login_recency"]
+        if d >= INACTIVE_HIGH_DAYS: frac = 1.0
+        elif d >= INACTIVE_MED_DAYS: frac = 0.6
+        elif d >= 7: frac = 0.25
+        else: frac = 0.0
+        ...
+
+    score_engagement(signals):
+        e = signals.get("engagement_score", 50)   # 0-100
+        # linear: 100 -> 0 penalty, 0 -> full penalty, knee at 40
+        frac = max(0.0, min(1.0, (40 - e) / 40)) if e < 40 else 0.0
+        if e >= 75: return (+3, "Strong engagement", "positive")
+        ...
+
+    score_support(signals):
+        c = signals.get("support_contacts", 0)
+        o = signals.get("open_tickets", 0)
+        ... SUPPORT_HIGH/MED buckets; +extra penalty if open_tickets>0
+        detail = f"{c} support contacts / {o} open in 90d"
+
+    score_sentiment(signals):
+        s = signals.get("avg_sentiment")
+        if s is None: return (0.0, "No recent feedback", "low")
+        w = FACTOR_WEIGHTS["sentiment"]
+        if s <= SENTIMENT_BAD: frac = min(1.0, (abs(s) )/0.7)
+        elif s < 0: frac = 0.3
+        elif s > 0.4: return (+4, "Positive feedback", "positive")
+        else: frac = 0.0
+        ...
+
+    score_payments(signals):
+        p = signals.get("payment_failures", 0)
+        w = FACTOR_WEIGHTS["payments"]
+        frac = 0.0 if p==0 else 0.6 if p==1 else 1.0
+        detail = f"{p} payment failure(s) in 90d"
+
+    score_tenure_renewal(signals):
+        dtr = signals.get("days_to_renewal", 999)
+        ten = signals.get("tenure_days", 0)
+        w = FACTOR_WEIGHTS["tenure_renewal"]
+        # risk if renewal soon AND (short tenure OR already showing risk)
+        near = dtr <= RENEWAL_SOON_DAYS
+        frac = 0.0
+        if near and ten < 180: frac = 1.0
+        elif near: frac = 0.5
+        if ten > 900: return (+3, "Long-tenured, loyal", "positive")
+        ...
+
+A2. risk_breakdown(signals):
+        factors = {
+          "usage": score_usage, "login_recency": score_login_recency,
+          "engagement": score_engagement, "support": score_support,
+          "sentiment": score_sentiment, "payments": score_payments,
+          "tenure_renewal": score_tenure_renewal,
+        }
+        contribs, positives = [], []
+        total = BASELINE
+        for key, fn in factors.items():
+            impact, detail, sev = fn(signals)
+            total += impact
+            row = {"factor": key, "label": LABELS[key], "impact": impact,
+                   "detail": detail, "severity": sev}
+            (positives if impact > 0 else contribs).append(row)
+        health = int(max(0, min(100, round(total))))
+        band = next(name for cut,name in BANDS if health >= cut)
+        contribs.sort(key=lambda r: r["impact"])          # most negative first
+        summary_line = build_summary(health, contribs)
+        return {...}
+
+A3. CROSS-CHECK vs ML (called by orchestrator, but define helper here):
+    def agreement(health_score, churn_prob) -> dict:
+        # map health to implied risk: implied = (100 - health)/100
+        implied = (100 - health_score) / 100
+        gap = abs(implied - churn_prob)
+        agree = gap <= 0.25
+        return {"agree": agree, "gap": round(gap,2),
+                "note": "" if agree else
+                  "Rule-based and ML risk disagree - review signals manually"}
+
+
+-------------------------------------------------------------------------------
+PART B — action_catalog.py
+-------------------------------------------------------------------------------
+
+B0. THE CATALOG (ordered list of rules; FIRST match wins)
+    Each entry: id, label, priority, channel, sla_hours, predicate(signals,prob),
+                query_template (for RAG), fallback list.
+
+    CATALOG = [
+      {
+        "id": "billing_fix_outreach",
+        "label": "Billing fix outreach + retention offer",
+        "priority": "P0", "channel": "call", "sla_hours": 24,
+        "predicate": lambda s,p: s.get("payment_failures",0) >= 2,
+        "matched_rule": "payment_failures>=2",
+        "query_template": "{plan_tier} customer with {payment_failures} payment "
+                          "failures in 90 days, needs billing resolution before "
+                          "any content or engagement outreach",
+        "fallback": ["csm_personal_checkin"],
+      },
+      {
+        "id": "live_support_callback",
+        "label": "Escalate to live support callback",
+        "priority": "P0", "channel": "call", "sla_hours": 24,
+        "predicate": lambda s,p: s.get("support_contacts",0) >= 3
+                                 or s.get("open_tickets",0) >= 2,
+        "matched_rule": "support_contacts>=3 or open_tickets>=2",
+        "query_template": "{plan_tier} customer with high support contact volume "
+                          "and unresolved tickets, negative sentiment",
+        "fallback": ["csm_personal_checkin"],
+      },
+      {
+        "id": "win_back_high_value",
+        "label": "Senior CSM win-back (high ARR, high risk)",
+        "priority": "P0", "channel": "csm_touch", "sla_hours": 48,
+        "predicate": lambda s,p: p >= 0.80 and s.get("arr",0) >= HIGH_ARR,
+        "matched_rule": "churn_prob>=0.80 and arr>=HIGH_ARR",
+        ...
+      },
+      {
+        "id": "renewal_downgrade_offer",
+        "label": "Offer downgrade before renewal",
+        "priority": "P1", "channel": "email", "sla_hours": 72,
+        "predicate": lambda s,p: s.get("days_to_renewal",999) <= 45
+                                 and s.get("engagement_score",100) < 45,
+        "matched_rule": "days_to_renewal<=45 and engagement<45",
+        ...
+      },
+      {
+        "id": "reengagement_content_email",
+        "label": "Curated content / value re-engagement email",
+        "priority": "P2", "channel": "email", "sla_hours": 120,
+        "predicate": lambda s,p: s.get("usage_trend_pct",0) <= -0.20
+                                 and s.get("complaint_count",0) == 0,
+        "matched_rule": "usage_trend<=-20% and no complaints",
+        ...
+      },
+      {
+        "id": "feature_adoption_nudge",
+        "label": "Feature adoption nudge (in-app + email)",
+        "priority": "P2", "channel": "in_app", "sla_hours": 120,
+        "predicate": lambda s,p: s.get("engagement_score",100) < 55
+                                 and s.get("last_login_days",0) < 14,
+        ...
+      },
+      {
+        "id": "csm_personal_checkin",
+        "label": "Personal CSM check-in",
+        "priority": "P1", "channel": "csm_touch", "sla_hours": 72,
+        "predicate": lambda s,p: p >= 0.50,      # generic at-risk catch
+        "matched_rule": "churn_prob>=0.50",
+        ...
+      },
+      {
+        "id": "monitor",
+        "label": "No action - monitor",
+        "priority": "P3", "channel": "none", "sla_hours": 0,
+        "predicate": lambda s,p: True,           # always-true fallback (last)
+        "matched_rule": "default",
+        "query_template": "healthy {plan_tier} customer, routine monitoring",
+        "fallback": [],
+      },
+    ]
+
+    CONSTANTS: HIGH_ARR = 300   # tune to dataset arr distribution
+
+B1. pick_base_action(signals, churn_prob):
+    for rule in CATALOG:
+        try:
+            if rule["predicate"](signals, churn_prob):
+                return _materialize(rule, signals, churn_prob)
+        except Exception:
+            continue          # a bad signal never breaks the pipeline
+    return _materialize(CATALOG[-1], signals, churn_prob)   # monitor
+
+    _materialize:
+      - format query_template with signals (safe .format_map with defaultdict)
+      - build playbook_query string (append dominant risk factor from a quick
+        internal call to scoring.risk_breakdown -> top contributor label)
+      - resolve fallback ids -> labels
+      - return the OUTPUT CONTRACT dict
+
+B2. PRIORITY SEMANTICS (documented in module docstring)
+    P0  act within 24h, human touch, likely escalation flag in orchestrator
+    P1  act within 72h, CSM owns
+    P2  automated/low-touch, within a week
+    P3  monitor only, no task created
+
+B3. GUARDRAILS
+    - The LLM (Step 6) receives action + action_label + priority and MUST NOT
+      change them. Its job: personalize the message + explain, not re-decide.
+    - If churn_prob < CHURN_THRESHOLD (.env 0.50) the orchestrator short-
+      circuits BEFORE the LLM; pick_base_action still runs so the low-risk
+      result carries a sensible ("monitor" / "feature_adoption_nudge") action.
+    - Keep predicates ordered by urgency: P0 rules first, "monitor" last.
+
+
+-------------------------------------------------------------------------------
+PART C — TESTS  (tests/test_scoring.py, tests/test_actions.py)
+-------------------------------------------------------------------------------
+Use plain pytest, hand-built signal dicts. No DB.
+
+scoring:
+  [ ] all-healthy signals -> health >= 80, band "healthy", contributors all
+      small/zero, positives non-empty
+  [ ] all-bad signals -> health <= 25, band "critical"
+  [ ] each factor in isolation: set only that factor bad, assert it's the
+      top contributor and impact magnitude ~ its weight
+  [ ] missing keys entirely -> no exception, health ~ near 100 (nothing to
+      penalize), as_of set
+  [ ] avg_sentiment=None -> sentiment factor impact == 0
+  [ ] health bounded [0,100] for extreme inputs (usage_trend_pct=-5.0 etc.)
+  [ ] agreement(): health=90,prob=0.1 -> agree; health=90,prob=0.8 -> disagree
+
+actions:
+  [ ] payment_failures=3 -> "billing_fix_outreach", P0 (even if prob low)
+  [ ] support_contacts=4 -> "live_support_callback", P0
+  [ ] prob=0.9, arr=500 -> "win_back_high_value", P0
+  [ ] days_to_renewal=20, engagement=30 -> "renewal_downgrade_offer", P1
+  [ ] usage_trend_pct=-0.35, complaint_count=0 -> "reengagement_content_email"
+  [ ] healthy signals, prob=0.1 -> "monitor", P3
+  [ ] first-match-wins: payment_failures=3 AND usage down -> billing wins
+  [ ] playbook_query is a non-empty string containing plan_tier
+  [ ] never raises on empty dict {}
+
+
+-------------------------------------------------------------------------------
+PART D — INTEGRATION NOTES (how Steps 4/6/7 consume this)
+-------------------------------------------------------------------------------
+- Step 4 RAG: uses base_action["playbook_query"] verbatim as the retrieval
+  query. Keep query_template phrasing close to how playbook snippets are
+  written (Step 4 authors 8-12 snippets - align vocabulary: "payment
+  failures", "declining usage", "approaching renewal", "support volume").
+- Step 6 LLM prompt gets: signals, churn_prob, risk_breakdown (full dict),
+  playbook_snippet, base_action. Instruction: recommended_action must equal
+  base_action["action_label"] (elaborated, not replaced).
+- Step 7 orchestrator:
+    breakdown   = scoring.risk_breakdown(signals)
+    base_action = action_catalog.pick_base_action(signals, churn_prob)
+    result["escalate"] = base_action["priority"] == "P0"
+    result["method_agreement"] = scoring.agreement(
+        breakdown["health_score"], churn_prob)
+- Step 8 API: GET /customers returns health_score + risk_band + top contributor
+  (cheap, computed on the fly from signals — no LLM). GET /customers/{id}
+  returns the full breakdown dict.
+
+
+-------------------------------------------------------------------------------
+PART E — DELIVERABLES CHECKLIST FOR STEP 3
+-------------------------------------------------------------------------------
+  [ ] app/services/scoring.py
+        - CONSTANTS block, 7 factor sub-functions, risk_breakdown(),
+          agreement() helper, LABELS dict, build_summary()
+  [ ] app/services/action_catalog.py
+        - CATALOG list (8 rules incl. monitor default), pick_base_action(),
+          _materialize(), priority docstring, HIGH_ARR constant
+  [ ] tests/test_scoring.py + tests/test_actions.py  (all green)
+  [ ] both modules import with ZERO third-party deps beyond stdlib
+      (pandas optional; prefer plain python for portability)
+  [ ] quick manual demo: run a tiny __main__ in each file that prints the
+      breakdown/action for 3 sample customers (healthy / renewal-risk /
+      billing-broken) so you can eyeball tuning
+  [ ] tune FACTOR_WEIGHTS + HIGH_ARR against real arr / engagement
+      distributions (pull 5 real rows from churn_agent.db, sanity-check the
+      scores look right)
+  [ ] commit app/services/*.py + tests/ to the repo
+
+
+WATCH-OUTS
+  - Keep it PURE. The moment scoring.py touches the DB or the model, it stops
+    being the independent "explainable" leg of the story.
+  - Don't let health_score and churn_prob be computed from each other.
+  - Order matters in CATALOG: P0 predicates must precede the generic
+    churn_prob>=0.50 catch, which must precede "monitor".
+  - format_map with a defaultdict(str) so a missing signal key in a
+    query_template never throws.
+NEXT: Step 4 — services/rag.py (playbook.json corpus + Ollama embeddings +
+      cosine retrieve()).
+===============================================================================

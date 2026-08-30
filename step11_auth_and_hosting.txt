@@ -1,0 +1,360 @@
+===============================================================================
+STEP 11 — LOGIN SCREEN + FREE HOSTING (Hugging Face Spaces, Docker)
+Files:  app/routers/auth.py        (new)
+        app/deps.py                (require_auth -> real session check)
+        app/main.py                (SessionMiddleware)
+        frontend/index.html        (login card + credentials:"include")
+        Dockerfile                 (new, repo root)
+        README.md                  (new/updated — HF Space frontmatter)
+        .dockerignore              (new)
+        start.sh                   (new, repo root)
+        tests/test_auth.py         (new)
+Churn Risk Agent  ·  detailed end-to-end implementation plan
+===============================================================================
+
+GOAL
+----
+1. A real username/password LOGIN SCREEN (not the browser Basic-Auth popup),
+   backed by a signed-cookie session. One shared account from env vars.
+2. Deploy the whole app (FastAPI + XGBoost + SQLite + Gemini) to a FREE,
+   always-reachable public URL on Hugging Face Spaces (Docker SDK).
+
+WHY HUGGING FACE SPACES (free tier)
+  - 16 GB RAM, 2 vCPU  -> no OOM risk, keep `shap`, model + embeddings fit easily
+  - Free forever; only sleeps after 48 h of no traffic (Render free sleeps
+    after 15 min) -> deploy the day before, open it once, it stays warm
+  - Outbound HTTPS allowed -> Gemini API + embeddings work
+  - Public URL: https://<user>-<space-name>.hf.space
+  - Cost: $0
+
+TRADE-OFFS (accepted)
+  - URL is *.hf.space, not a custom domain (fine for a hackathon)
+  - Filesystem is EPHEMERAL across rebuilds/restarts -> churn_agent.db is
+    rebuilt on boot from the committed CSV (deterministic seed=42, so the 40
+    demo customers + ids 3767 / 4837 are identical every time). The
+    `analyses` table starts empty on each cold start — you run Analyze live
+    in the demo anyway, so this is a non-issue. Say so in KNOWN_ISSUES.md.
+
+
+===============================================================================
+PART 1 — LOGIN SCREEN (auth)
+===============================================================================
+
+1A. MECHANISM
+  Signed session cookie via Starlette SessionMiddleware (itsdangerous).
+  Single shared credential pair: APP_USERNAME / APP_PASSWORD (env).
+  AUTH_DISABLED=1 fully bypasses auth (local dev + tests). Prod sets it to 0.
+
+  requirements.txt: add `itsdangerous` (SessionMiddleware needs it).
+
+1B. app/main.py
+  from starlette.middleware.sessions import SessionMiddleware
+  app.add_middleware(
+      SessionMiddleware,
+      secret_key=os.environ.get("SECRET_KEY", "dev-insecure-change-me"),
+      session_cookie="cra_session",
+      https_only=(os.getenv("COOKIE_SECURE", "0") == "1"),
+      same_site="lax",
+      max_age=60 * 60 * 8,          # 8h
+  )
+  Middleware order: SessionMiddleware BEFORE CORS is fine; StaticFiles still
+  mounted LAST.
+
+1C. app/routers/auth.py  (NEW — prefix /api, NO require_auth dependency)
+  import os, secrets
+  from fastapi import APIRouter, HTTPException, Request
+  from pydantic import BaseModel
+
+  router = APIRouter(prefix="/api", tags=["auth"])
+  _U = os.getenv("APP_USERNAME", "admin")
+  _P = os.getenv("APP_PASSWORD", "admin")
+  _DISABLED = os.getenv("AUTH_DISABLED", "1") == "1"
+
+  class LoginBody(BaseModel):
+      username: str
+      password: str
+
+  @router.post("/login")
+  def login(body: LoginBody, request: Request):
+      ok = (secrets.compare_digest(body.username, _U)
+            and secrets.compare_digest(body.password, _P))
+      if not ok:
+          raise HTTPException(401, "Invalid username or password")
+      request.session["user"] = body.username
+      return {"user": body.username}
+
+  @router.post("/logout")
+  def logout(request: Request):
+      request.session.clear()
+      return {"ok": True}
+
+  @router.get("/me")
+  def me(request: Request):
+      if _DISABLED:
+          return {"user": "dev"}
+      user = request.session.get("user")
+      if not user:
+          raise HTTPException(401, "Not authenticated")
+      return {"user": user}
+
+  Register FIRST in main.py (before the protected routers), and it must NOT
+  carry the require_auth dependency.
+
+1D. app/deps.py  — replace the stub body
+  from fastapi import Request, HTTPException
+  def require_auth(request: Request) -> str:
+      if os.getenv("AUTH_DISABLED", "1") == "1":
+          return "dev"
+      user = request.session.get("user")
+      if not user:
+          raise HTTPException(401, "Not authenticated")
+      return user
+  (All existing /api routers keep dependencies=[Depends(require_auth)].)
+
+1E. frontend/index.html
+  - App bootstrap: BEFORE routing, call GET /api/me (credentials:"include").
+      200 -> store user, render normal app (renderDashboard / route()).
+      401 -> render LOGIN CARD, stop.
+  - LOGIN CARD (reuse design tokens; centered, max-width 360px):
+      logo mark + "Churn Risk Agent"
+      <label>Username</label> <input id=u autocomplete=username>
+      <label>Password</label> <input id=p type=password
+                                     autocomplete=current-password>
+      <button>Sign in</button>   (primary, --accent)
+      <p class=err> (hidden until failure) </p>
+      Submit on Enter. No "register", no "forgot password", no OAuth.
+  - Submit handler:
+      POST /api/login {username,password}  (credentials:"include")
+        200 -> location.hash = "#/"; render app
+        401 -> show err "Invalid username or password"; shake input (subtle,
+               respect prefers-reduced-motion)
+  - EVERY api() fetch: add  credentials: "include"  (cookie must ride along).
+  - Global 401 handler in api(): if any protected call returns 401 mid-
+    session -> clear state, render login card.
+  - Top-bar menu: add "Sign out" -> POST /api/logout -> render login card.
+
+1F. tests/test_auth.py  (run with AUTH_DISABLED=0)
+  Use TestClient; note SessionMiddleware needs SECRET_KEY set in the test env.
+  [ ] POST /api/login wrong creds -> 401
+  [ ] POST /api/login correct creds -> 200 {"user": ...}; cookie set
+  [ ] GET /api/me with the session cookie -> 200
+  [ ] GET /api/me without cookie -> 401
+  [ ] GET /api/customers without cookie -> 401
+  [ ] GET /api/customers WITH cookie -> 200
+  [ ] POST /api/logout -> then /api/me -> 401
+  Existing tests keep running with AUTH_DISABLED=1 (unchanged).
+
+1G. .env additions
+  SECRET_KEY=<paste 40+ random chars>
+  APP_USERNAME=admin
+  APP_PASSWORD=<pick a real one>
+  AUTH_DISABLED=1          # local dev; prod (HF) sets 0
+  COOKIE_SECURE=0          # local; prod sets 1 (HF serves https)
+
+
+===============================================================================
+PART 2 — HOSTING ON HUGGING FACE SPACES (Docker, free)
+===============================================================================
+
+2A. PREP THE REPO (local, before creating the Space)
+  1. Remove Ollama dependency for prod: EMBED_BACKEND will be `gemini`.
+     Generate + COMMIT the Gemini embedding cache:
+        PowerShell:  $env:EMBED_BACKEND="gemini"
+                     py -c "from app.services import rag; rag.warm()"
+        git add data/playbook_embeddings.gemini.pkl
+     (rag.py must name the cache with the backend, per step4 — verify the
+      .gemini.pkl file appears and its corpus_hash matches playbook.json)
+  2. Ensure COMMITTED (not gitignored):
+        ml/churn_model.pkl, ml/feature_columns.pkl, ml/preprocess.pkl,
+        ml/model_card.json, ml/features.py, ml/__init__.py
+        data/customer_churn_raw.csv          (public dataset, ~10k rows)
+        data/playbook.json
+        data/playbook_embeddings.gemini.pkl
+        frontend/index.html
+     Still IGNORED:
+        churn_agent.db                       (rebuilt on boot)
+        data/playbook_embeddings.ollama.pkl  (local only)
+        .env
+  3. requirements.txt: keep `shap` (16 GB RAM is plenty). Ensure present:
+        fastapi, uvicorn[standard], itsdangerous, google-generativeai,
+        httpx, xgboost, scikit-learn, pandas, numpy, joblib, sqlalchemy,
+        python-dotenv, shap
+  4. Code must run on Python 3.12 (Docker base below). You develop on 3.14 —
+     scan for 3.14-only syntax; there should be none.
+
+2B. start.sh  (repo root, LF line endings, chmod +x)
+  #!/usr/bin/env bash
+  set -e
+  # rebuild the SQLite DB from the committed CSV if missing (ephemeral FS)
+  [ -f churn_agent.db ] || python load_dataset.py
+  # model artifacts are committed; only train if somehow absent
+  [ -f ml/churn_model.pkl ] || python ml/train_model.py
+  exec uvicorn app.main:app --host 0.0.0.0 --port "${PORT:-7860}"
+
+  NOTE: HF Spaces routes to the port in README `app_port` (7860 by default).
+  Uvicorn must bind 0.0.0.0:7860.
+
+2C. Dockerfile  (repo root)
+  FROM python:3.12-slim
+
+  # HF Spaces best practice: non-root user, writable home
+  RUN useradd -m -u 1000 user
+  ENV HOME=/home/user PATH=/home/user/.local/bin:$PATH \
+      PYTHONUNBUFFERED=1 PORT=7860
+  WORKDIR /home/user/app
+
+  # system deps (xgboost/llvmlite/shap need libgomp; build-essential for wheels)
+  RUN apt-get update && apt-get install -y --no-install-recommends \
+        libgomp1 && rm -rf /var/lib/apt/lists/*
+
+  COPY --chown=user:user requirements.txt .
+  RUN pip install --no-cache-dir --user -r requirements.txt
+
+  COPY --chown=user:user . .
+  RUN chmod +x start.sh
+
+  USER user
+  EXPOSE 7860
+  CMD ["bash", "start.sh"]
+
+2D. .dockerignore  (repo root)
+  .git
+  .venv
+  __pycache__/
+  *.pyc
+  churn_agent.db
+  data/playbook_embeddings.ollama.pkl
+  .env
+  tests/
+  step*.txt
+  *.md
+  !README.md
+
+2E. README.md  (repo root — HF reads the YAML frontmatter; keep it FIRST)
+  ---
+  title: Churn Risk Agent
+  emoji: 📉
+  colorFrom: indigo
+  colorTo: blue
+  sdk: docker
+  app_port: 7860
+  pinned: false
+  ---
+
+  # Churn Risk Agent
+  Deterministic health score + XGBoost churn model + RAG-grounded LLM
+  retention recommendations, with a CSM approve/edit flow.
+  (rest of the readme is fine — only the frontmatter is load-bearing)
+
+2F. CREATE THE SPACE (on huggingface.co — you do this manually)
+  1. Sign in / sign up at https://huggingface.co  (free)
+  2. https://huggingface.co/new-space
+       Owner: your username
+       Space name: churn-risk-agent
+       License: mit (or apache-2.0)
+       SDK: **Docker**  ->  "Blank" template
+       Hardware: **CPU basic (free)**   (2 vCPU, 16 GB)
+       Visibility: Public
+  3. It creates an empty git repo at
+       https://huggingface.co/spaces/<user>/churn-risk-agent
+
+2G. PUSH THE CODE (add HF as a second remote)
+  # in the project folder
+  git remote add space https://huggingface.co/spaces/<user>/churn-risk-agent
+  # HF needs an access token as the git password:
+  #   https://huggingface.co/settings/tokens  -> New token (write) -> copy
+  git push space main
+  # when prompted: username = <your HF username>, password = <the token>
+  # (or:  git remote set-url space
+  #        https://<user>:<hf_token>@huggingface.co/spaces/<user>/churn-risk-agent )
+
+  The Space auto-builds on push. Watch the "Logs" tab (Building -> Running).
+  First build ~4-8 min (installing xgboost/shap). Later pushes are faster.
+
+2H. SET SECRETS  (Space -> Settings -> "Variables and secrets")
+  Secrets (encrypted):
+    GEMINI_API_KEY   = <your key>
+    APP_USERNAME     = <demo user>
+    APP_PASSWORD     = <demo password>
+    SECRET_KEY       = <random 40+ chars>
+  Variables (plain):
+    EMBED_BACKEND    = gemini
+    AUTH_DISABLED    = 0
+    COOKIE_SECURE    = 1
+    GEMINI_MODEL     = gemini-2.5-flash
+    CORS_ORIGINS     = *
+  After adding secrets -> "Restart this Space" (or Factory rebuild).
+
+2I. VERIFY THE DEPLOYMENT
+  App URL: https://<user>-churn-risk-agent.hf.space
+  [ ] URL loads -> LOGIN card appears (AUTH_DISABLED=0 working)
+  [ ] wrong creds -> "Invalid username or password"
+  [ ] correct creds -> dashboard, 40 rows, #3767 on top (after Step 9 sort fix)
+  [ ] GET https://<...>.hf.space/api/health  (in browser, after login) ->
+      ml.loaded true, rag.backend "gemini", llm.enabled true,
+      model gemini-2.5-flash
+  [ ] open #/customer/3767 -> Analyze -> live Gemini result, P0, playbook
+      cited, ~4-8 s (first call may be slower — model warm-up)
+  [ ] open #/customer/4837 -> Analyze -> low-risk shortcut, instant
+  [ ] approve flow works; refresh page -> still logged in (cookie persists)
+  [ ] Sign out -> login card returns
+  [ ] check Space "Logs" for tracebacks; check "Metrics" RAM stays < ~2 GB
+
+2J. KEEP IT WARM FOR THE DEMO
+  - HF free sleeps only after 48 h idle. Deploy >1 day early, open the URL
+    once, and it stays up.
+  - Optional belt-and-braces: a free cron-ping (cron-job.org / UptimeRobot)
+    hitting /api/health every 6 h. Not required.
+  - Right before presenting: open the URL, log in, pre-open #/customer/3767
+    so the first Analyze click on stage is warm.
+
+
+===============================================================================
+PART 3 — DELIVERABLES CHECKLIST FOR STEP 11
+===============================================================================
+AUTH
+  [ ] itsdangerous in requirements.txt
+  [ ] app/main.py: SessionMiddleware wired (SECRET_KEY env)
+  [ ] app/routers/auth.py: /api/login /api/logout /api/me (no require_auth)
+  [ ] app/deps.py: require_auth reads request.session, AUTH_DISABLED bypass
+  [ ] frontend: login card, /api/me bootstrap, credentials:"include" on ALL
+      fetches, global 401 -> login, "Sign out" in menu
+  [ ] tests/test_auth.py green with AUTH_DISABLED=0; old tests green with =1
+  [ ] .env: SECRET_KEY, APP_USERNAME, APP_PASSWORD, AUTH_DISABLED=1,
+      COOKIE_SECURE=0
+HOSTING
+  [ ] data/playbook_embeddings.gemini.pkl generated + committed
+  [ ] ml/*.pkl, data/customer_churn_raw.csv, data/playbook.json committed;
+      churn_agent.db + ollama pkl still gitignored
+  [ ] Dockerfile, .dockerignore, start.sh (LF, +x), README.md frontmatter
+  [ ] HF Space created (Docker SDK, CPU basic free, public)
+  [ ] git remote `space` added; `git push space main` succeeds; build green
+  [ ] secrets + variables set in Space settings; Space restarted
+  [ ] PART 2I verification all ticked; live Analyze on 3767 works
+  [ ] KNOWN_ISSUES.md: ephemeral FS (db rebuilt on boot, analyses reset),
+      48h sleep, first-request warm-up
+  [ ] final URL recorded for the demo + LinkedIn post (Step 12)
+  [ ] commit everything; push to BOTH `origin` (GitHub) and `space` (HF)
+
+TIME BUDGET: ~60-90 min
+  (25 auth server+front, 15 auth tests, 20 docker/readme/start.sh,
+   15 create space + push + secrets, 15 verify + fix)
+
+WATCH-OUTS
+  - credentials:"include" on EVERY fetch or the session cookie is dropped and
+    you get 401 loops.
+  - COOKIE_SECURE=1 in prod (HF is https); =0 locally (http) or the cookie
+    won't set.
+  - README.md YAML frontmatter must be the very first bytes of the file, or
+    HF ignores sdk/app_port and the Space won't start.
+  - Dockerfile: run as non-root `user`, WORKDIR under /home/user, and the
+    app dir must be writable (churn_agent.db + any cache write there).
+  - Bind uvicorn to 0.0.0.0:7860 (matches README app_port). Not 127.0.0.1.
+  - Push to `space` uses your HF WRITE token as the git password, not your
+    account password.
+  - Do NOT commit .env — set every secret in the Space settings UI.
+  - If build OOMs or times out (unlikely at 16 GB): drop `shap`, the
+    ml_model.explain fallback covers it.
+NEXT: Step 10 — end-to-end pass + 3-min demo script (customers 3767 / 4837),
+      then Step 12 — LinkedIn post with the live hf.space URL + screenshots.
+===============================================================================

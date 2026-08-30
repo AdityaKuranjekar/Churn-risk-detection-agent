@@ -1,0 +1,360 @@
+===============================================================================
+STEP 6 — LLM INTEGRATION  (Gemini structured recommendation call)
+Files:  app/services/llm.py
+        app/services/prompts.py       (prompt text kept separate & testable)
+        tests/test_llm.py
+Churn Risk Agent  ·  detailed end-to-end implementation plan
+===============================================================================
+
+GOAL
+----
+ONE well-constrained Gemini call that turns the pipeline's structured inputs
+into a CSM-ready recommendation as strict JSON.
+
+  analyze(signals, churn_prob, breakdown, playbook_snippet, base_action) -> dict
+  returns EXACTLY:
+    {
+      "summary": str,                 # 2-3 sentences, cites the playbook
+      "top_reasons": [str, str, str], # <= 3, each grounded in a real signal
+      "recommended_action": str,      # == base_action["action_label"] (elaborated)
+      "priority": "P0"|"P1"|"P2"|"P3",# == base_action["priority"] (unchanged)
+      "draft_message": str,           # personalized outreach to the customer
+      "playbook_citation": str        # the playbook title it used, or ""
+    }
+
+NON-NEGOTIABLES
+  - The LLM DOES NOT re-decide the action or priority. Those come from Step 3
+    (deterministic). The LLM elaborates + personalizes + explains.
+  - Every top_reason must trace to a value in `signals` or `breakdown`.
+    No invented facts, no hallucinated usage numbers.
+  - Output is machine-parsed. Use Gemini JSON mode + a strict schema +
+    safe_json_parse with one retry. Never let a bad parse crash the pipeline.
+  - Deterministic-ish: temperature low (0.3-0.4). Seed not available on Gemini,
+    so accept minor wording variance; structure must be stable.
+  - Offline fallback: if GEMINI_API_KEY missing OR the call fails twice,
+    return a TEMPLATED result built from the structured inputs so the demo
+    and tests still work. Mark it with "_generated_by": "fallback".
+
+
+-------------------------------------------------------------------------------
+PART A — CONFIG  (top of llm.py)
+-------------------------------------------------------------------------------
+    import os, json, re, logging
+    GEMINI_API_KEY  = os.getenv("GEMINI_API_KEY")
+    GEMINI_MODEL    = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+    LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.35"))
+    LLM_MAX_TOKENS  = int(os.getenv("LLM_MAX_TOKENS", "900"))
+    LLM_TIMEOUT_S   = int(os.getenv("LLM_TIMEOUT_S", "30"))
+    LLM_ENABLED     = bool(GEMINI_API_KEY) and os.getenv("LLM_DISABLE") != "1"
+
+    _client = None
+    def _get_model():
+        global _client
+        if _client is None:
+            import google.generativeai as genai
+            genai.configure(api_key=GEMINI_API_KEY)
+            _client = genai.GenerativeModel(GEMINI_MODEL)
+        return _client
+
+    Response schema (Gemini structured output):
+      RESPONSE_SCHEMA = {
+        "type": "object",
+        "properties": {
+          "summary": {"type": "string"},
+          "top_reasons": {"type": "array", "items": {"type": "string"},
+                          "maxItems": 3},
+          "recommended_action": {"type": "string"},
+          "priority": {"type": "string", "enum": ["P0","P1","P2","P3"]},
+          "draft_message": {"type": "string"},
+          "playbook_citation": {"type": "string"},
+        },
+        "required": ["summary","top_reasons","recommended_action",
+                     "priority","draft_message"],
+      }
+    generation_config = {
+      "temperature": LLM_TEMPERATURE,
+      "max_output_tokens": LLM_MAX_TOKENS,
+      "response_mime_type": "application/json",
+      "response_schema": RESPONSE_SCHEMA,      # Gemini enforces shape
+    }
+
+
+-------------------------------------------------------------------------------
+PART B — app/services/prompts.py  (the prompt, isolated)
+-------------------------------------------------------------------------------
+Keep prompt strings here so they can be unit-tested and iterated without
+touching call logic.
+
+SYSTEM_INSTRUCTION (passed as system_instruction on the GenerativeModel):
+"""
+You are a Customer Success retention analyst. You receive structured signals,
+an ML churn probability, a deterministic risk breakdown, one retrieved
+retention-playbook snippet, and a REQUIRED action already chosen by the
+system. Your job:
+  - Explain WHY this customer is at risk, grounding every reason in the
+    provided signals or risk breakdown. Never invent numbers or events.
+  - Produce a short, specific outreach message the CSM can send with minimal
+    edits, personalized to this customer's situation and plan.
+  - Keep `recommended_action` as an elaboration of the REQUIRED action -
+    do NOT substitute a different action. Keep `priority` exactly as given.
+  - Reference the playbook snippet explicitly in `summary`
+    (e.g. "Per playbook 'Repeated payment failures', ...").
+Return ONLY the JSON object matching the schema. No markdown, no prose outside
+JSON.
+"""
+
+def build_user_prompt(signals, churn_prob, breakdown, playbook_snippet,
+                      base_action) -> str:
+    # Trim signals to the fields that matter; format numbers readably.
+    compact = {
+      "name": signals.get("name"),
+      "plan_tier": signals.get("plan_tier"),
+      "tenure_days": signals.get("tenure_days"),
+      "arr": signals.get("arr"),
+      "days_to_renewal": signals.get("days_to_renewal"),
+      "usage_trend_pct": signals.get("usage_trend_pct"),
+      "last_login_days": signals.get("last_login_days"),
+      "logins_last_30": signals.get("logins_last_30"),
+      "payment_failures": signals.get("payment_failures"),
+      "support_contacts": signals.get("support_contacts"),
+      "open_tickets": signals.get("open_tickets"),
+      "avg_sentiment": signals.get("avg_sentiment"),
+      "engagement_score": signals.get("engagement_score"),
+    }
+    return f"""
+CUSTOMER SIGNALS:
+{json.dumps(compact, indent=2, default=str)}
+
+ML CHURN PROBABILITY: {churn_prob:.0%}
+ML TOP DRIVERS: {json.dumps(signals.get("ml_top_features", []), default=str)}
+
+DETERMINISTIC RISK BREAKDOWN (health {breakdown.get('health_score')}/100,
+band {breakdown.get('risk_band')}):
+{json.dumps(breakdown.get('contributors', []), indent=2, default=str)}
+Positives: {json.dumps(breakdown.get('positives', []), default=str)}
+
+RETRIEVED PLAYBOOK SNIPPET:
+  title: {playbook_snippet.get('title')}
+  guidance: {playbook_snippet.get('text')}
+  (retrieval_method: {playbook_snippet.get('retrieval_method')},
+   low_confidence: {playbook_snippet.get('low_confidence')})
+
+REQUIRED ACTION (do not change):
+  action_label: {base_action.get('action_label')}
+  priority: {base_action.get('priority')}
+  channel: {base_action.get('channel')}
+  rationale: {base_action.get('rationale')}
+
+TASK:
+  1. summary: 2-3 sentences. Must cite the playbook title. State the single
+     biggest risk driver and the ML probability in plain language.
+  2. top_reasons: up to 3 bullet strings, each tied to a specific signal
+     value above (quote the number).
+  3. recommended_action: restate REQUIRED action_label, elaborated into a
+     concrete next step for the CSM via {base_action.get('channel')}.
+  4. priority: exactly "{base_action.get('priority')}".
+  5. draft_message: 60-120 words, addressed to {signals.get('name')},
+     appropriate to a {signals.get('plan_tier')} plan, matching the playbook
+     guidance and channel tone. No placeholders like [NAME].
+  6. playbook_citation: the playbook title you used.
+If the playbook snippet is low_confidence or its guidance conflicts with the
+REQUIRED action, prefer the REQUIRED action and keep the playbook for tone
+only; still fill playbook_citation.
+"""
+
+HEDGE note for orchestrator: it may pass playbook_snippet with
+low_confidence=True; the prompt already handles it.
+
+
+-------------------------------------------------------------------------------
+PART C — CALL + PARSE  (llm.py core)
+-------------------------------------------------------------------------------
+
+C1. safe_json_parse(raw: str) -> dict | None
+    - strip ```json fences / leading text
+    - try json.loads
+    - if fail: try to locate the first '{' ... last '}' and parse that slice
+    - return None on total failure
+
+C2. _validate_and_coerce(obj, base_action) -> dict
+    - ensure all required keys present; fill missing with fallback values
+    - top_reasons: coerce to list[str], truncate to 3, drop empties
+    - FORCE priority = base_action["priority"]  (never trust the model here)
+    - FORCE recommended_action to start from base_action["action_label"];
+      if the model returned something unrelated (fuzzy check: action_label
+      keywords not present), replace with a templated elaboration
+    - playbook_citation: default to playbook_snippet["title"] if blank
+    - strip any markdown / stray backticks from strings
+    - clamp lengths: summary <= 600 chars, draft_message <= 900 chars
+
+C3. analyze(signals, churn_prob, breakdown, playbook_snippet, base_action)
+    if not LLM_ENABLED:
+        return _fallback(...)                      # Part D
+    prompt = build_user_prompt(...)
+    for attempt in (1, 2):
+        try:
+            resp = _get_model().generate_content(
+                prompt,
+                generation_config=generation_config,
+                system_instruction=SYSTEM_INSTRUCTION,   # or set on model init
+                request_options={"timeout": LLM_TIMEOUT_S},
+            )
+            obj = safe_json_parse(resp.text)
+            if obj is None and attempt == 1:
+                prompt = prompt + "\n\nYour previous output was not valid " \
+                         "JSON. Return ONLY the JSON object, nothing else."
+                continue
+            if obj is None:
+                break
+            out = _validate_and_coerce(obj, base_action)
+            out["_generated_by"] = f"gemini:{GEMINI_MODEL}"
+            out["_attempt"] = attempt
+            return out
+        except Exception as e:
+            logging.warning("LLM attempt %s failed: %s", attempt, e)
+            if attempt == 2:
+                break
+    return _fallback(signals, churn_prob, breakdown, playbook_snippet,
+                     base_action, reason="llm_error_or_bad_json")
+
+C4. Token/cost note: ~1 call per high-risk customer analyze. gemini-2.0-flash
+    is cheap; 40 demo customers = a few cents. No batching needed. Add a
+    simple in-process LRU cache keyed by
+    (customer_id, round(churn_prob,2), base_action["action"], playbook_id)
+    so re-clicking Analyze doesn't re-bill — TTL not needed for a demo, but
+    clear it when signals change. Optional.
+
+
+-------------------------------------------------------------------------------
+PART D — _fallback(...)  (templated, deterministic, no network)
+-------------------------------------------------------------------------------
+Build the SAME output shape from structured inputs only:
+
+  top_contribs = breakdown["contributors"][:3]
+  summary = (f"{signals['name']} ({signals['plan_tier']}) shows "
+             f"{breakdown['risk_band']} risk (health "
+             f"{breakdown['health_score']}/100, ML churn {churn_prob:.0%}). "
+             f"Primary driver: {top_contribs[0]['label']}. "
+             f"Per playbook '{playbook_snippet.get('title','')}', "
+             f"{base_action['action_label'].lower()} is recommended.")
+  top_reasons = [f"{c['label']}: {c['detail']}" for c in top_contribs]
+  recommended_action = base_action["action_label"]
+  priority = base_action["priority"]
+  draft_message = _template_message(signals, base_action, playbook_snippet)
+      # 2-3 canned sentences per channel (email/call/in_app/csm_touch),
+      # slotting in name, plan, and the top driver. Keep it usable, not fancy.
+  playbook_citation = playbook_snippet.get("title", "")
+  _generated_by = "fallback"
+
+The fallback is not just for outages — it's the reference implementation of
+the output contract and doubles as a golden test fixture.
+
+
+-------------------------------------------------------------------------------
+PART E — tests/test_llm.py
+-------------------------------------------------------------------------------
+Default: run with LLM_DISABLE=1 so tests are offline, fast, free, deterministic.
+Add ONE opt-in live test gated on an env flag (RUN_LIVE_LLM=1).
+
+OFFLINE (fallback path):
+  [ ] analyze(...) with LLM disabled returns all 7 keys, correct types
+  [ ] priority == base_action["priority"] exactly
+  [ ] recommended_action == base_action["action_label"]
+  [ ] top_reasons is list[str], len <= 3, non-empty for a risky customer
+  [ ] playbook_citation == playbook_snippet["title"]
+  [ ] _generated_by == "fallback"
+  [ ] draft_message contains signals["name"], no "[" placeholder chars
+  [ ] no exception when playbook_snippet has low_confidence=True
+  [ ] no exception when breakdown has zero contributors (healthy edge)
+
+PARSE / COERCE (unit, no network):
+  [ ] safe_json_parse('```json\n{"a":1}\n```') == {"a":1}
+  [ ] safe_json_parse('garbage {"summary":"x",...} trailing') recovers object
+  [ ] safe_json_parse('not json at all') is None
+  [ ] _validate_and_coerce overrides a wrong priority the "model" returned
+  [ ] _validate_and_coerce replaces an off-topic recommended_action
+  [ ] top_reasons of length 5 gets truncated to 3
+  [ ] missing draft_message gets a templated one
+
+PROMPT (unit):
+  [ ] build_user_prompt includes the playbook title, the required action
+      label, the churn %, and at least 3 signal values
+  [ ] no KeyError when signals is missing optional fields
+
+LIVE (opt-in, RUN_LIVE_LLM=1):
+  [ ] one real Gemini call for a critical customer returns valid JSON,
+      priority matches, summary mentions the playbook title substring
+
+
+-------------------------------------------------------------------------------
+PART F — INTEGRATION NOTES (Steps 7 / 8)
+-------------------------------------------------------------------------------
+Step 7 orchestrator (high-risk branch only):
+    ml        = ml_model.predict_from_customer(customer_row)
+    signals["ml_top_features"] = ml["top_features"]      # so prompt can use them
+    breakdown = scoring.risk_breakdown(signals)
+    base_act  = action_catalog.pick_base_action(signals, ml["churn_probability"])
+    snippet   = rag.retrieve_best(rag.build_query(signals, base_act))
+    llm_out   = llm.analyze(signals, ml["churn_probability"], breakdown,
+                            snippet, base_act)
+    result = {**llm_out, "ml": ml, "risk_breakdown": breakdown,
+              "base_action": base_act,
+              "playbook": {"id": snippet["id"], "title": snippet["title"],
+                           "score": snippet["score"],
+                           "method": snippet["retrieval_method"]},
+              "escalate": base_act["priority"] == "P0",
+              "method_agreement": scoring.agreement(
+                  breakdown["health_score"], ml["churn_probability"])}
+    save_analysis(customer_id, result)
+
+Low-risk branch: DO NOT call llm.analyze. Build a minimal result:
+    {"summary": f"{name} healthy (health .../100, churn ...%). Monitor.",
+     "top_reasons": [...top positives...], "recommended_action": "Monitor",
+     "priority": "P3", "draft_message": "", "playbook_citation": "",
+     "_generated_by": "low_risk_shortcut", "ml": ml, "risk_breakdown": ...}
+
+Step 8 API:
+  - analyses table stores the full `result` dict (JSON columns). schemas.py
+    Pydantic model mirrors the 7 LLM keys + ml + risk_breakdown + playbook.
+  - POST /customers/{id}/analyze -> orchestrator -> store -> return result
+  - GET /customers/{id} returns the last stored analysis (no re-call)
+  - Optional GET /llm/health -> {"enabled": LLM_ENABLED, "model": GEMINI_MODEL}
+
+Deployment: GEMINI_API_KEY set in Render dashboard (already planned). If unset,
+LLM_ENABLED=False and every analyze() uses the fallback — app still works,
+demo just loses the generative polish. Good safety net.
+
+
+-------------------------------------------------------------------------------
+PART G — DELIVERABLES CHECKLIST FOR STEP 6
+-------------------------------------------------------------------------------
+  [ ] app/services/prompts.py — SYSTEM_INSTRUCTION + build_user_prompt()
+  [ ] app/services/llm.py:
+        config, _get_model (lazy), RESPONSE_SCHEMA + generation_config,
+        safe_json_parse, _validate_and_coerce (forces priority + action),
+        analyze() with 2-attempt retry + timeout, _fallback() + _template_message
+  [ ] tests/test_llm.py — offline fallback + parse/coerce + prompt unit;
+        one opt-in live test
+  [ ] .env: add LLM_TEMPERATURE=0.35, LLM_MAX_TOKENS=900, LLM_TIMEOUT_S=30
+        (GEMINI_API_KEY / GEMINI_MODEL already there)
+  [ ] manual offline:  LLM_DISABLE=1 py -c "..."  -> prints valid 7-key JSON
+  [ ] manual live: py -c "from app.services.llm import analyze; ..." with a
+        critical customer -> real Gemini JSON, priority preserved, playbook
+        title cited in summary
+  [ ] confirm google-generativeai already in requirements.txt (it is)
+  [ ] commit prompts.py + llm.py + tests + .env additions
+
+
+WATCH-OUTS
+  - The model is NOT the decision-maker. _validate_and_coerce FORCES
+    priority and re-anchors recommended_action. Test this explicitly.
+  - JSON mode + response_schema still occasionally returns junk on timeout /
+    safety block -> safe_json_parse + fallback must both be solid.
+  - Don't put PII beyond first name in the prompt; no need for email/id.
+  - Keep temperature low; you want reproducible structure, not creativity.
+  - The fallback IS part of the contract — keep its output shape byte-for-byte
+    identical to the LLM path (same keys, same types).
+NEXT: Step 7 — app/services/orchestrator.py (wire ml_model + scoring +
+      action_catalog + rag + llm into analyze_customer(); low-risk shortcut;
+      get_signals() from DB; save_analysis()).
+===============================================================================

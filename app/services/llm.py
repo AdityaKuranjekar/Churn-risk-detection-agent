@@ -37,7 +37,6 @@ RESPONSE_SCHEMA = {
 
 generation_config = {
     "temperature": LLM_TEMPERATURE,
-    "max_output_tokens": LLM_MAX_TOKENS,
     "response_mime_type": "application/json",
     "response_schema": RESPONSE_SCHEMA,
 }
@@ -100,6 +99,8 @@ def _validate_and_coerce(obj: dict, base_action: dict, playbook_snippet: dict) -
     # fallback for draft_message if it's completely missing
     if not out["draft_message"]:
         out["draft_message"] = _template_message({"name": ""}, base_action, playbook_snippet)
+    else:
+        out["draft_message"] = re.sub(r'\[.*?\]', '', out["draft_message"])
         
     return out
 

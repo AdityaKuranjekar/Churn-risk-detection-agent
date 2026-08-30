@@ -1,0 +1,297 @@
+===============================================================================
+STEP 5 — ML MODEL SERVING WRAPPER
+Files:  app/services/ml_model.py
+        ml/features.py            (already created in Step 2 — VERIFY / EXTEND)
+        tests/test_ml_model.py
+Churn Risk Agent  ·  detailed end-to-end implementation plan
+===============================================================================
+
+GOAL
+----
+A thin, import-once inference layer around the trained XGBoost model so the
+orchestrator (Step 7) can turn a customer DB row into a churn probability with
+a single call, and never drift from how the model was trained.
+
+  load churn_model.pkl / feature_columns.pkl / preprocess.pkl ONCE at import
+  predict(feature_dict) -> float in [0,1]
+  build_feature_dict(customer_row) -> dict   (DB row -> model input)
+  predict_from_customer(customer_row) -> {"churn_probability", "band",
+                                          "top_features", "model_version"}
+
+HARD RULE
+  Feature derivation lives in EXACTLY ONE place: ml/features.py.
+  Both ml/train_model.py (Step 2) and this file import it. If you find any
+  derived-feature math duplicated here, delete it and call features.py.
+
+
+-------------------------------------------------------------------------------
+PART A — VERIFY ml/features.py  (the single source of truth)
+-------------------------------------------------------------------------------
+Step 2 created it. Before writing ml_model.py, open it and confirm it exposes:
+
+  BASE_COLS : list[str]
+      raw columns pulled straight from `customers` that feed the model
+      (e.g. tenure_days, monthly_charges, arr, plan_tier_ord, num_devices,
+       age, payment_failures, support_contacts, engagement_score,
+       last_login_days, usage_level)
+
+  FINAL_FEATURE_ORDER : list[str]   (optional if feature_columns.pkl is canon)
+      the exact ordered feature names the model expects
+
+  derive_features(obj) -> pandas.DataFrame
+      accepts a dict (1 row) OR a DataFrame (N rows)
+      returns a DataFrame with ALL engineered columns:
+        usage_per_tenure, charges_per_device, arr_to_usage, tenure_bucket
+        (ordinal), is_month_to_month, high_support_flag, payment_risk_flag,
+        recent_inactivity_flag, low_engagement_flag, age_missing, ...
+      MUST be pure: no DB, no model, deterministic, NaN-safe on missing inputs.
+
+IF features.py does NOT already accept a dict:
+  add that path now (small refactor). Signature target:
+      def derive_features(obj: dict | pd.DataFrame) -> pd.DataFrame:
+          df = pd.DataFrame([obj]) if isinstance(obj, dict) else obj.copy()
+          ... existing derivation ...
+          return df
+  Re-run Step 2's `py ml/train_model.py --no-save` afterwards to confirm the
+  refactor didn't change features / metrics (AUC should be identical).
+
+IF feature order is only implicit:
+  rely on feature_columns.pkl (saved in Step 2) as the canonical order.
+  ml_model.py reindexes to that list; features.py just needs to PRODUCE all
+  of them (order-independent).
+
+
+-------------------------------------------------------------------------------
+PART B — app/services/ml_model.py
+-------------------------------------------------------------------------------
+
+B0. PATHS / LOAD-ONCE (module level, runs at first import)
+    import joblib, json, os, numpy as np, pandas as pd
+    from pathlib import Path
+    from ml.features import derive_features            # single source of truth
+
+    ML_DIR = Path(os.getenv("ML_DIR", "ml"))
+    MODEL_PATH   = ML_DIR / "churn_model.pkl"
+    COLS_PATH    = ML_DIR / "feature_columns.pkl"
+    PRE_PATH     = ML_DIR / "preprocess.pkl"
+    CARD_PATH    = ML_DIR / "model_card.json"
+
+    class ModelNotLoaded(RuntimeError): ...
+
+    def _load():
+        if not MODEL_PATH.exists():
+            raise ModelNotLoaded(
+                f"{MODEL_PATH} missing - run `py ml/train_model.py` first")
+        model = joblib.load(MODEL_PATH)
+        cols  = joblib.load(COLS_PATH)                 # ordered list[str]
+        pre   = joblib.load(PRE_PATH)                  # {"medians":{...}, ...}
+        card  = json.loads(CARD_PATH.read_text()) if CARD_PATH.exists() else {}
+        return model, cols, pre, card
+
+    _MODEL, _COLS, _PRE, _CARD = _load()
+    _MEDIANS  = _PRE.get("medians", {})
+    _THRESH   = float(_CARD.get("threshold_used", os.getenv("CHURN_THRESHOLD", 0.5)))
+    _VERSION  = _CARD.get("trained_at", "unknown")
+
+    NOTE: import-time load means a missing pkl crashes app startup with a clear
+    message. That's desired (fail fast). Step 8 main.py can catch ModelNotLoaded
+    in its lifespan and log a friendly hint.
+
+B1. build_feature_dict(customer_row: dict | Mapping) -> dict
+    Purpose: normalize a raw `customers` table row into the flat input
+    derive_features() expects. Handles column-name differences and types.
+
+        def build_feature_dict(row) -> dict:
+            g = (lambda k, d=None: row.get(k, d)) if hasattr(row, "get") \
+                else (lambda k, d=None: getattr(row, k, d))
+            fd = {
+              "tenure_days":      _num(g("tenure_days"), 0),
+              "monthly_charges":  _num(g("monthly_charges"), 0.0),
+              "arr":              _num(g("arr"), _num(g("monthly_charges"),0)*12),
+              "plan_tier_ord":    int(_num(g("plan_tier_ord"),
+                                     {"Basic":0,"Standard":1,"Premium":2}
+                                     .get(g("plan_tier"), 1))),
+              "num_devices":      int(_num(g("num_devices"), 1)),
+              "age":              g("age"),                # may be None
+              "payment_failures": int(_num(g("payment_failures"), 0)),
+              "support_contacts": int(_num(g("support_contacts"), 0)),
+              "engagement_score": _num(g("engagement_score"), None),
+              "last_login_days":  int(_num(g("last_login_days"), 0)),
+              "usage_level":      _num(g("usage_level"), 0.0),
+            }
+            return fd
+        # _num(v, default): float(v) if v not None/NaN/'' else default
+
+    This mirrors BASE_COLS. If Step 2 used a different base set, MATCH IT here
+    (read BASE_COLS from features.py and assert fd covers them).
+
+B2. _vectorize(feature_dict: dict) -> pd.DataFrame  (1 row, model-ready)
+        df = derive_features(feature_dict)             # -> 1-row DataFrame
+        # impute any missing/NaN engineered col with training median
+        for c in _COLS:
+            if c not in df.columns:
+                df[c] = _MEDIANS.get(c, 0.0)
+        df = df[_COLS]                                 # exact order
+        df = df.apply(pd.to_numeric, errors="coerce")
+        df = df.fillna(pd.Series(_MEDIANS)).fillna(0.0)
+        df = df.replace([np.inf, -np.inf], 0.0)
+        return df
+
+B3. predict(feature_dict: dict) -> float
+        X = _vectorize(feature_dict)
+        p = float(_MODEL.predict_proba(X)[0, 1])
+        return min(1.0, max(0.0, p))                   # clamp defensively
+
+    predict_many(list[dict]) -> list[float]            # loop or vstack; small N
+
+B4. band(prob: float) -> str
+        # decision bands for the UI (independent of scoring.py's health bands)
+        if prob >= 0.80: return "critical"
+        if prob >= _THRESH: return "at_risk"           # _THRESH ~0.5 or card val
+        if prob >= 0.30: return "watch"
+        return "healthy"
+
+B5. explain(feature_dict, top_n=5) -> list[{feature, value, contribution}]
+    Cheap per-prediction driver list for the UI / LLM.
+    Preferred: SHAP if available
+        import shap
+        _EXPL = shap.TreeExplainer(_MODEL)             # build once at module load
+        sv = _EXPL.shap_values(X)[0]
+        pairs = sorted(zip(_COLS, X.iloc[0].tolist(), sv),
+                       key=lambda t: abs(t[2]), reverse=True)[:top_n]
+    Fallback (no shap): use _MODEL.feature_importances_ * (x - median) as a
+    rough signed contribution. Mark method in the output.
+    NOTE: this is the ML explanation; scoring.py's risk_breakdown is the
+    rule-based one. The UI shows both — "two methods".
+
+B6. predict_from_customer(customer_row) -> dict   (the orchestrator entry point)
+        fd = build_feature_dict(customer_row)
+        p  = predict(fd)
+        return {
+          "churn_probability": round(p, 4),
+          "band": band(p),
+          "threshold_used": _THRESH,
+          "top_features": explain(fd, top_n=5),
+          "model_version": _VERSION,
+        }
+
+B7. health() -> dict     (for Step 8 GET /ml/health)
+        return {"loaded": True, "n_features": len(_COLS),
+                "model_version": _VERSION, "threshold": _THRESH,
+                "test_auc": _CARD.get("test_auc"),
+                "test_pr_auc": _CARD.get("test_pr_auc")}
+
+
+-------------------------------------------------------------------------------
+PART C — IMPORT PATH / PACKAGING GOTCHA
+-------------------------------------------------------------------------------
+app/services/ml_model.py does `from ml.features import derive_features`.
+For that to resolve when running `uvicorn app.main:app` from the repo root:
+  - repo root must be on sys.path (it is, when uvicorn is launched from root)
+  - ml/ needs an __init__.py  -> add `ml/__init__.py` (empty) if missing
+  - tests run from root too (pytest rootdir already = repo root, confirmed)
+If you prefer isolation, alternatively COPY features.py logic into a shared
+package `app/ml_features.py` imported by BOTH train and serve — but a single
+file imported twice is simpler. Keep ml/features.py as the one copy.
+
+
+-------------------------------------------------------------------------------
+PART D — tests/test_ml_model.py
+-------------------------------------------------------------------------------
+Requires the Step 2 pkls to exist (they do, committed). If not, skip with a
+clear message.
+
+  [ ] module imports without error; _MODEL, _COLS, _PRE populated
+  [ ] len(_COLS) == model n_features_in_ (xgb: _MODEL.n_features_in_)
+  [ ] predict() on 3 hand-built dicts is monotonic:
+        healthy  -> low   (< 0.15)
+        mid      -> middle
+        critical -> high  (> 0.80)
+      (reuse the exact dicts from Step 2's self_check so numbers match:
+       p(healthy)~0.07, p(mid)~0.23, p(critical)~0.99)
+  [ ] predict() with a dict MISSING keys (e.g. no age, no engagement_score)
+        -> no exception, output in [0,1]
+  [ ] predict({}) -> no exception, returns a float in [0,1]
+  [ ] output strictly within [0,1] for absurd inputs
+        (tenure_days=-5, payment_failures=999, usage_level=1e9)
+  [ ] build_feature_dict() accepts a dict AND an object with attributes
+        (simulate a SQLAlchemy row via a SimpleNamespace) -> same result
+  [ ] build_feature_dict() covers every name in features.BASE_COLS
+  [ ] band(): 0.05->healthy, 0.4->watch/at_risk per threshold, 0.9->critical
+  [ ] explain() returns <= top_n items, each with feature/value/contribution,
+        method field present; feature names are a subset of _COLS
+  [ ] predict_from_customer(SimpleNamespace(**healthy_row)) has all 5 keys
+  [ ] determinism: same input twice -> identical float (==, not approx)
+  [ ] consistency with training: pick 5 rows from churn_agent.db, run
+        predict_from_customer, assert probs correlate with churn_label
+        direction (mean prob for churn=1 rows > mean prob for churn=0 rows)
+
+
+-------------------------------------------------------------------------------
+PART E — INTEGRATION NOTES (Steps 6 / 7 / 8)
+-------------------------------------------------------------------------------
+Step 7 orchestrator:
+    from app.services import ml_model, scoring, action_catalog, rag
+    ml = ml_model.predict_from_customer(customer_row)
+    churn_prob = ml["churn_probability"]
+    breakdown  = scoring.risk_breakdown(signals)
+    base_action= action_catalog.pick_base_action(signals, churn_prob)
+    if churn_prob < float(os.getenv("CHURN_THRESHOLD", 0.5)):
+        -> low-risk result (still include ml + breakdown + base_action)
+    else:
+        snippet = rag.retrieve_best(rag.build_query(signals, base_action))
+        result  = llm.analyze(signals, churn_prob, breakdown, snippet, base_action)
+    result["ml"] = ml            # carry probability + band + top_features + version
+    result["method_agreement"] = scoring.agreement(
+        breakdown["health_score"], churn_prob)
+
+Step 6 llm.analyze: gets churn_prob (str "%") + ml["top_features"] so the LLM
+can mention the ML drivers alongside the rule-based ones.
+
+Step 8 main.py:
+    - GET /ml/health  -> ml_model.health()
+    - GET /customers list: call predict_from_customer per demo customer
+      (40 rows -> 40 fast predictions, no LLM) to populate churn % + band.
+      Consider caching the last analysis in the `analyses` table instead of
+      recomputing every list hit (orchestrator already stores it).
+    - Wrap the import in try/except ModelNotLoaded in lifespan; log the hint.
+
+Deployment (Render): ml/*.pkl are committed, so predict works on boot. If you
+chose start.sh retrain-on-missing, that also covers it. shap is optional —
+if not in requirements, explain() uses the fallback automatically.
+
+
+-------------------------------------------------------------------------------
+PART F — DELIVERABLES CHECKLIST FOR STEP 5
+-------------------------------------------------------------------------------
+  [ ] ml/__init__.py exists (empty) so `from ml.features import ...` resolves
+  [ ] ml/features.py verified: derive_features accepts dict OR DataFrame,
+        exposes BASE_COLS; --no-save retrain shows unchanged AUC
+  [ ] app/services/ml_model.py:
+        _load() import-once, build_feature_dict, _vectorize, predict,
+        predict_many, band, explain (shap + fallback), predict_from_customer,
+        health
+  [ ] tests/test_ml_model.py green (monotonic, missing-keys, determinism,
+        db-consistency)
+  [ ] manual: py -c "from app.services.ml_model import predict_from_customer;
+        import json; print(json.dumps(predict_from_customer(
+        {'tenure_days':30,'monthly_charges':19.99,'plan_tier':'Premium',
+         'num_devices':1,'payment_failures':3,'support_contacts':4,
+         'engagement_score':12,'last_login_days':40,'usage_level':20}),
+        indent=2))"
+        -> churn_probability high (~0.9+), band "critical", top_features listed
+  [ ] add `shap` to requirements.txt ONLY if you want SHAP explanations
+        (otherwise fallback is fine and keeps deploy lean)
+  [ ] commit app/services/ml_model.py + ml/__init__.py + tests + any
+        features.py tweak
+
+WATCH-OUTS
+  - ONE feature derivation. Never re-implement math from features.py here.
+  - Column order: always reindex to feature_columns.pkl before predict_proba.
+  - Import-time load is intentional; don't lazy-load unless startup time bites.
+  - band() (ML decision bands) is SEPARATE from scoring.py risk_band (health
+    score bands). Different inputs, different purpose — don't merge them.
+  - Keep predict() side-effect free (no DB writes). The orchestrator persists.
+NEXT: Step 6 — app/services/llm.py (Gemini structured call, JSON mode,
+      safe_json_parse with one retry).
+===============================================================================

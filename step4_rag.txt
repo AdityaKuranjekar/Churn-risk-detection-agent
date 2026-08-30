@@ -1,0 +1,361 @@
+===============================================================================
+STEP 4 — RAG: PLAYBOOK CORPUS + EMBEDDINGS + RETRIEVAL
+Files:  data/playbook.json
+        app/services/rag.py
+        app/services/embeddings.py   (backend-switchable embed())
+        tests/test_rag.py
+Churn Risk Agent  ·  detailed end-to-end implementation plan
+===============================================================================
+
+GOAL
+----
+Ground the LLM's retention recommendation in a small, curated corpus of
+retention playbook snippets so the output cites real guidance instead of
+free-associating.
+
+  1. Author 10-12 short playbook snippets  -> data/playbook.json
+  2. Embed them ONCE, cache vectors to disk (per backend)
+  3. retrieve(query_text, top_k=1) -> best-matching snippet(s) via cosine sim
+     (in-memory numpy; NO vector DB)
+  4. embed() is backend-switchable:
+        local dev  -> Ollama  (nomic-embed-text, 768-dim)
+        deployed   -> Gemini  (text-embedding-004, 768-dim)
+     controlled by .env EMBED_BACKEND = ollama | gemini
+
+WHERE IT PLUGS IN
+  - Step 3 action_catalog.pick_base_action() already emits base_action
+    ["playbook_query"]  <-- rag.retrieve() consumes this VERBATIM.
+  - Step 6 llm.analyze() receives the retrieved snippet as grounding context;
+    prompt instructs the model to cite it ("per playbook: ...").
+  - Step 7 orchestrator: only calls retrieve() on the HIGH-RISK branch
+    (churn_prob >= CHURN_THRESHOLD). Low-risk path skips RAG entirely.
+
+DESIGN PRINCIPLES
+  - Corpus is tiny and hand-written. No chunking pipeline, no PDF parsing.
+  - Retrieval must be instant and offline-capable (Ollama local).
+  - Deterministic: same query + same corpus + same backend -> same result.
+  - Graceful degradation: if the embedding backend is unreachable, fall back
+    to a keyword/lexical score so the pipeline NEVER hard-fails on RAG.
+  - Vocabulary of snippets MUST match the phrasing of Step 3 query_templates
+    ("payment failures", "declining usage", "approaching renewal", "support
+    volume", "low engagement", "high-value account").
+
+
+-------------------------------------------------------------------------------
+PART A — data/playbook.json  (the corpus)
+-------------------------------------------------------------------------------
+Schema: a JSON list of objects.
+[
+  {
+    "id": "pb_billing_failures",
+    "title": "Repeated payment failures",
+    "tags": ["billing", "payment failures", "involuntary churn", "P0"],
+    "applies_when": "2+ failed payments in the last 90 days",
+    "text": "For customers with two or more payment failures in the last 90 "
+            "days, treat this as involuntary churn risk first. Reach out on a "
+            "call (not email) within 24 hours to fix the payment method, and "
+            "offer a one-month credit or discount as goodwill. Do NOT lead "
+            "with content or engagement messaging until billing is resolved.",
+    "recommended_action": "billing_fix_outreach",
+    "channel": "call"
+  },
+  ...
+]
+
+FIELDS
+  id                 stable snake_case key (referenced in analyses.playbook_id)
+  title              short human label (shown in UI: "per playbook: <title>")
+  tags               keywords -> used by the lexical fallback scorer
+  applies_when       one-line trigger condition (human-readable)
+  text               2-4 sentences of concrete guidance. THIS is what gets
+                     embedded and what the LLM quotes. Be specific: channel,
+                     timing, offer, sequence.
+  recommended_action MUST be one of the Step 3 CATALOG ids (keeps RAG aligned
+                     with the deterministic action; orchestrator can assert
+                     they match or note divergence)
+  channel            email | call | in_app | csm_touch
+
+REQUIRED SNIPPETS (author all of these; ids must match CATALOG where noted):
+  pb_billing_failures        -> billing_fix_outreach       (P0)
+  pb_support_overload        -> live_support_callback       (P0)
+  pb_high_value_winback      -> win_back_high_value         (P0)
+  pb_renewal_downgrade       -> renewal_downgrade_offer     (P1)
+  pb_declining_usage_no_complaints -> reengagement_content_email (P2)
+  pb_low_feature_adoption    -> feature_adoption_nudge      (P2)
+  pb_generic_csm_checkin     -> csm_personal_checkin        (P1)
+  pb_healthy_monitor         -> monitor                     (P3)
+EXTRA (nice to have, improves retrieval quality):
+  pb_negative_sentiment_spike   (feedback sentiment sharply negative)
+  pb_new_customer_onboarding_gap (short tenure + low early usage)
+  pb_multi_device_drop           (device count dropped / single-device now)
+  pb_price_sensitivity           (complaints mention price / value)
+
+WRITING RULES
+  - 40-90 words each. One scenario per snippet.
+  - Name the channel and the timing explicitly.
+  - Include the sequencing rule when order matters (billing before content).
+  - Avoid product specifics that could be wrong; keep it CS-generic.
+  - No overlap so heavy that two snippets are near-duplicates (hurts top-1).
+
+VALIDATION (a tiny check in rag.py load):
+  - ids unique
+  - every recommended_action is a known CATALOG id (import the id set from
+    action_catalog) -> warn on mismatch, don't crash
+  - 8-14 entries total
+
+
+-------------------------------------------------------------------------------
+PART B — app/services/embeddings.py  (backend-switchable embed)
+-------------------------------------------------------------------------------
+Single responsibility: text -> np.ndarray(float32), L2-normalized.
+
+CONFIG (read once at import):
+    EMBED_BACKEND   = os.getenv("EMBED_BACKEND", "ollama").lower()
+    OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+    OLLAMA_MODEL    = os.getenv("OLLAMA_EMBED_MODEL", "nomic-embed-text")
+    GEMINI_API_KEY  = os.getenv("GEMINI_API_KEY")
+    GEMINI_EMBED_MODEL = os.getenv("GEMINI_EMBED_MODEL", "models/text-embedding-004")
+    EMBED_DIM_EXPECTED = 768   # both models are 768; assert to catch mixups
+
+API:
+    def embed_one(text: str) -> np.ndarray            # (768,) float32, unit norm
+    def embed_many(texts: list[str]) -> np.ndarray    # (N,768)
+    def backend_info() -> dict   # {"backend":..., "model":..., "dim":...}
+
+IMPLEMENTATION
+  ollama:
+      POST {OLLAMA_BASE_URL}/api/embeddings
+           json={"model": OLLAMA_MODEL, "prompt": text}
+      -> resp.json()["embedding"]  (list[float], len 768)
+      batch: loop (Ollama has no batch endpoint for this) — fine for 12 items.
+      timeout=30s, one retry on ConnectionError.
+  gemini:
+      import google.generativeai as genai
+      genai.configure(api_key=GEMINI_API_KEY)
+      genai.embed_content(model=GEMINI_EMBED_MODEL, content=text,
+                          task_type="retrieval_document"  # for corpus
+                          / "retrieval_query"             # for the query)
+      -> resp["embedding"]
+      NOTE: use task_type="retrieval_query" when embedding the incoming
+      query and "retrieval_document" when embedding snippets. Expose a
+      `kind: "doc"|"query"` arg on embed_one/embed_many; ollama ignores it.
+
+POST-PROCESS (both backends):
+    v = np.asarray(vec, dtype=np.float32)
+    assert v.shape[-1] == EMBED_DIM_EXPECTED
+    v /= (np.linalg.norm(v) + 1e-12)     # unit norm -> cosine == dot product
+    return v
+
+ERRORS
+  - any backend failure raises EmbeddingUnavailable(Exception) with the cause.
+  - rag.retrieve() catches it and switches to lexical fallback (Part C).
+
+
+-------------------------------------------------------------------------------
+PART C — app/services/rag.py  (corpus load + cache + retrieve)
+-------------------------------------------------------------------------------
+
+C0. PATHS / CONFIG
+    PLAYBOOK_PATH = "data/playbook.json"
+    CACHE_PATH    = f"data/playbook_embeddings.{EMBED_BACKEND}.pkl"
+       # backend in the filename so switching ollama<->gemini never mixes vectors
+    TOP_K_DEFAULT = 1
+    MIN_SIM_WARN  = 0.20   # below this, retrieval is basically a guess -> flag
+
+C1. LOAD CORPUS
+    load_playbook() -> list[dict]
+      - read json, run PART A validation
+      - keep an in-module singleton _CORPUS
+
+C2. BUILD / LOAD CACHE
+    cache file schema (pickle dict):
+      {
+        "backend": EMBED_BACKEND,
+        "model": <model name>,
+        "dim": 768,
+        "ids": [id, ...]                      # order matches matrix rows
+        "matrix": np.ndarray (N, 768) float32 (unit-normed),
+        "corpus_hash": sha1(playbook.json bytes),   # rebuild if corpus changed
+        "built_at": iso,
+      }
+    get_matrix():
+      - if cache exists AND cache["corpus_hash"] == current hash AND
+        cache["backend"] == EMBED_BACKEND -> load it
+      - else: embed_many([s["text"] for s in corpus], kind="doc"),
+              stack, save cache, return
+    warm() -> called on FastAPI startup (Step 8 main.py lifespan) so the first
+             user request isn't slow. Logs backend_info() + N snippets.
+
+C3. RETRIEVE
+    def retrieve(query_text: str, top_k: int = 1,
+                 return_scores: bool = True) -> list[dict]:
+      corpus = load_playbook(); ids, M = get_matrix()
+      try:
+          q = embed_one(query_text, kind="query")           # (768,)
+          sims = M @ q                                       # cosine (unit vecs)
+          method = "embedding"
+      except EmbeddingUnavailable:
+          sims = _lexical_scores(query_text, corpus)         # Part C4
+          method = "lexical_fallback"
+      order = np.argsort(-sims)[:top_k]
+      results = []
+      for rank, i in enumerate(order):
+          s = dict(corpus[i])
+          s["score"] = float(sims[i])
+          s["rank"] = rank
+          s["retrieval_method"] = method
+          s["low_confidence"] = bool(sims[i] < MIN_SIM_WARN)
+          results.append(s)
+      return results
+
+    Convenience:
+    def retrieve_best(query_text) -> dict:  return retrieve(query_text,1)[0]
+
+C4. LEXICAL FALLBACK  (_lexical_scores)
+    - tokenize query + each snippet's (title + tags + applies_when + text)
+    - lowercase, strip punctuation, drop stopwords
+    - score = jaccard(query_tokens, snippet_tokens)
+              + 0.5 * (# query tokens found in snippet.tags)
+    - return np.array aligned to corpus order
+    Purpose: keep the demo alive if Ollama isn't running / Gemini key missing.
+    Log a WARNING when this path is used.
+
+C5. QUERY BUILDER HELPER (optional, used by orchestrator)
+    def build_query(signals: dict, base_action: dict) -> str:
+      # base_action["playbook_query"] is already good (from Step 3).
+      # This helper just enriches it with 1-2 concrete numbers so embedding
+      # retrieval has more to grab onto:
+      bits = [base_action["playbook_query"]]
+      if signals.get("payment_failures"): bits.append(
+          f'{signals["payment_failures"]} payment failures')
+      if signals.get("usage_trend_pct", 0) < -0.15: bits.append(
+          f'usage down {abs(signals["usage_trend_pct"]):.0%}')
+      if signals.get("days_to_renewal", 999) <= 45: bits.append(
+          f'{signals["days_to_renewal"]} days to renewal')
+      if (signals.get("avg_sentiment") or 0) < -0.3: bits.append(
+          "negative customer sentiment")
+      return "; ".join(bits)
+    Orchestrator may call retrieve(build_query(signals, base_action)) OR just
+    retrieve(base_action["playbook_query"]). Default: use build_query.
+
+C6. ALIGNMENT CHECK (called by orchestrator, defined here)
+    def action_matches(snippet: dict, base_action: dict) -> bool:
+      return snippet.get("recommended_action") == base_action["action"]
+    Orchestrator adds result["playbook_aligned"] = action_matches(...).
+    If False: still pass the snippet to the LLM, but the prompt notes
+    "playbook guidance may differ from the assigned action; prefer the
+    assigned action, use the playbook for tone/sequencing."
+
+
+-------------------------------------------------------------------------------
+PART D — tests/test_rag.py
+-------------------------------------------------------------------------------
+Run with EMBED_BACKEND unset (ollama default). Mark embedding-backed tests to
+skip gracefully if Ollama not reachable; lexical + corpus tests always run.
+
+CORPUS (no backend needed):
+  [ ] playbook.json parses, 8-14 entries, ids unique
+  [ ] every recommended_action is in action_catalog CATALOG id set
+  [ ] every text is 20-120 words; required ids all present
+
+LEXICAL FALLBACK (no backend needed — force it):
+  [ ] retrieve("2 payment failures, billing broken, premium",
+               _force_lexical=True)[0]["id"] == "pb_billing_failures"
+  [ ] retrieve("declining usage, no complaints, wants more content")
+        -> "pb_declining_usage_no_complaints"
+  [ ] retrieve("account approaching renewal with low engagement")
+        -> "pb_renewal_downgrade"
+  [ ] retrieve("") does not raise; returns 1 result with low_confidence True
+  [ ] retrieval_method field == "lexical_fallback" when forced
+
+EMBEDDING PATH (skip if backend down):
+  [ ] warm() builds cache file at data/playbook_embeddings.<backend>.pkl
+  [ ] cache reused on 2nd call (mtime unchanged); rebuilt after editing
+      playbook.json (corpus_hash changes)
+  [ ] top-1 for the 8 canonical queries matches expected ids (allow 6/8 pass
+      to tolerate embedding fuzziness; log the misses)
+  [ ] every returned vector path yields score in [-1, 1]
+  [ ] switching EMBED_BACKEND changes CACHE_PATH (no vector mixing)
+
+ORCHESTRATOR HELPERS:
+  [ ] build_query(signals, base_action) returns non-empty str with the
+      base query + at least the payment-failure enrichment when present
+  [ ] action_matches(snippet, base_action) True for aligned pair, False else
+
+
+-------------------------------------------------------------------------------
+PART E — INTEGRATION NOTES (Steps 6/7/8)
+-------------------------------------------------------------------------------
+Step 6 llm.analyze(signals, churn_prob, breakdown, playbook_snippet, base_action)
+  - prompt includes:  playbook_snippet["title"] + playbook_snippet["text"]
+  - instruction: "Cite this guidance in `summary` as 'per playbook: <title>'.
+    Keep `recommended_action` equal to the assigned action label."
+  - if playbook_snippet["low_confidence"] or not playbook_aligned -> add the
+    hedge line from C6.
+
+Step 7 orchestrator (high-risk branch only):
+    q        = rag.build_query(signals, base_action)
+    snippet  = rag.retrieve_best(q)
+    result["playbook_id"]        = snippet["id"]
+    result["playbook_title"]     = snippet["title"]
+    result["playbook_score"]     = snippet["score"]
+    result["playbook_method"]    = snippet["retrieval_method"]
+    result["playbook_aligned"]   = rag.action_matches(snippet, base_action)
+    -> pass snippet into llm.analyze(...)
+
+Step 8 main.py (lifespan startup):
+    from app.services import rag
+    rag.warm()          # builds/loads the cache, logs backend_info
+  Also expose (optional, handy for demo):
+    GET /rag/health   -> backend_info() + N snippets + cache path + built_at
+    POST /rag/retrieve  body {"query": "..."}  -> retrieve(query, top_k=3)
+      (dev/demo only; put behind the same Basic Auth)
+
+
+-------------------------------------------------------------------------------
+PART F — DEPLOYMENT NOTES (Render)
+-------------------------------------------------------------------------------
+  - Ollama does NOT run on Render free tier. Set EMBED_BACKEND=gemini in the
+    Render dashboard env (already in render.yaml plan from implementation.md).
+  - COMMIT data/playbook_embeddings.gemini.pkl so the deploy doesn't need to
+    re-embed the corpus on boot (only the per-request query is embedded).
+      * generate it locally once:  EMBED_BACKEND=gemini python -c
+        "from app.services import rag; rag.warm()"
+      * verify corpus_hash matches the committed playbook.json
+  - Keep data/playbook_embeddings.ollama.pkl in .gitignore (local only).
+  - requirements.txt already has google-generativeai + httpx; add nothing.
+  - If GEMINI_API_KEY is missing at runtime -> embeddings.py raises ->
+    rag falls back to lexical. Demo still works, just less semantically sharp.
+
+
+-------------------------------------------------------------------------------
+PART G — DELIVERABLES CHECKLIST FOR STEP 4
+-------------------------------------------------------------------------------
+  [ ] data/playbook.json  — 10-12 snippets, all required ids, validated
+  [ ] app/services/embeddings.py — embed_one/embed_many/backend_info,
+        ollama + gemini backends, unit-norm output, EmbeddingUnavailable
+  [ ] app/services/rag.py — load_playbook, get_matrix (disk cache w/
+        corpus_hash + backend in filename), retrieve / retrieve_best,
+        _lexical_scores fallback, build_query, action_matches, warm()
+  [ ] tests/test_rag.py — corpus + lexical always; embedding path skip-safe
+  [ ] local run:  `ollama pull nomic-embed-text` done; `python -c "from
+        app.services import rag; print(rag.retrieve_best('2 payment failures
+        premium account'))"` returns pb_billing_failures via "embedding"
+  [ ] generate + commit data/playbook_embeddings.gemini.pkl (deploy cache)
+  [ ] .gitignore excludes the ollama cache pkl
+  [ ] commit data/playbook.json + app/services/{rag,embeddings}.py + tests
+
+
+WATCH-OUTS
+  - task_type matters for Gemini: doc vs query embeddings. Get it right or
+    retrieval quality drops.
+  - Don't mix backend vectors — backend goes in the cache filename.
+  - Corpus hash guards staleness — always recompute on load, cheap.
+  - Snippet vocabulary must mirror Step 3 query_templates or top-1 retrieval
+    gets noisy. Co-edit them if you tweak either.
+  - RAG is the designated "safe cut" if time runs out: orchestrator can skip
+    retrieve() and drop the playbook line from the LLM prompt with no other
+    code changes. Keep that seam clean.
+NEXT: Step 5 — app/services/ml_model.py (load churn_model.pkl once, predict()
+      via ml/features.py shared derivation).
+===============================================================================

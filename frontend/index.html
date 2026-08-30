@@ -1,0 +1,1759 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Churn Risk Agent</title>
+  <meta name="description" content="Churn Risk Agent - internal retention dashboard: XGBoost churn model + rule-based health score + RAG-grounded LLM recommendations." />
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath fill='%232563eb' d='M12 2L4 6v6c0 5.25 3.4 10.15 8 11.35C16.6 22.15 20 17.25 20 12V6L12 2zm-1 13.41L7.59 12 9 10.59l2 2 4-4L16.41 9 11 15.41z'/%3E%3C/svg%3E" />
+  <noscript>This dashboard requires JavaScript.</noscript>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          colors: {
+            bg:'#ffffff', surface:'#f7f8fa', 'surface-2':'#f0f2f5',
+            border:'#e4e7ec', 'border-2':'#d0d5dd',
+            text:'#101828', 'text-2':'#475467', 'text-3':'#667085',
+            accent:'#2563eb', 'accent-weak':'#eff4ff', 'accent-text':'#1d4ed8',
+            crit:'#d92d20', 'crit-bg':'#fef3f2',
+            high:'#dc6803', 'high-bg':'#fffaeb',
+            watch:'#eaaa08', 'watch-bg':'#fefbe8',
+            ok:'#099250', 'ok-bg':'#ecfdf3',
+            neutral:'#475467', 'neutral-bg':'#f2f4f7',
+          },
+          fontFamily: { sans:['-apple-system','BlinkMacSystemFont','"Segoe UI"','Roboto','"Helvetica Neue"','Arial','sans-serif'] },
+          borderRadius: { DEFAULT:'8px', sm:'6px', full:'9999px' },
+          boxShadow: { card:'0 1px 2px rgba(16,24,40,.06), 0 1px 3px rgba(16,24,40,.04)' },
+        }
+      }
+    };
+  </script>
+  <style>
+    :root {
+      --bg:#ffffff; --surface:#f7f8fa; --surface-2:#f0f2f5;
+      --border:#e4e7ec; --border-2:#d0d5dd;
+      --text:#101828; --text-2:#475467; --text-3:#667085;
+      --accent:#2563eb; --accent-weak:#eff4ff; --accent-text:#1d4ed8;
+      --crit:#d92d20; --crit-bg:#fef3f2;
+      --high:#dc6803; --high-bg:#fffaeb;
+      --watch:#eaaa08; --watch-bg:#fefbe8;
+      --ok:#099250; --ok-bg:#ecfdf3;
+      --neutral:#475467; --neutral-bg:#f2f4f7;
+      --font:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;
+      --fs-11:11px;--fs-12:12px;--fs-13:13px;--fs-14:14px;
+      --fs-16:16px;--fs-20:20px;--fs-24:24px;
+      --s-1:4px;--s-2:8px;--s-3:12px;--s-4:16px;--s-5:24px;--s-6:32px;
+      --radius:8px;--radius-sm:6px;
+      --shadow:0 1px 2px rgba(16,24,40,.06),0 1px 3px rgba(16,24,40,.04);
+    }
+    *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+    html{scroll-behavior:smooth}
+    body{font:400 var(--fs-14)/1.45 var(--font);color:var(--text);background:var(--surface);-webkit-font-smoothing:antialiased;min-height:100vh}
+    .tabular{font-variant-numeric:tabular-nums}
+
+    /* Topbar */
+    #topbar{position:sticky;top:0;z-index:100;height:56px;background:var(--bg);border-bottom:1px solid var(--border);display:flex;align-items:center;padding:0 var(--s-5);gap:var(--s-4)}
+    .brand{display:flex;align-items:center;gap:var(--s-2);font-size:var(--fs-14);font-weight:600;color:var(--text);text-decoration:none}
+    .spacer{flex:1}
+    .topbar-right{display:flex;align-items:center;gap:var(--s-4)}
+    .health-dot{display:flex;align-items:center;gap:var(--s-2);font-size:var(--fs-13);color:var(--text-2);cursor:pointer;border:none;background:none;padding:4px 8px;border-radius:var(--radius-sm);font-family:var(--font)}
+    .health-dot:hover{background:var(--surface-2)}
+    .dot{width:8px;height:8px;border-radius:9999px;background:var(--ok);flex-shrink:0}
+    .dot.degraded{background:var(--high)}
+    .kbdhint{font-size:var(--fs-11);color:var(--text-3);background:var(--surface-2);border:1px solid var(--border);border-radius:4px;padding:2px 7px;cursor:pointer;font-family:var(--font);line-height:1.4}
+    .kbdhint:hover{background:var(--border)}
+    .demo-menu{position:relative}
+    .demo-btn{font-size:var(--fs-13);color:var(--text-2);background:none;border:1px solid var(--border);border-radius:var(--radius-sm);padding:4px 10px;cursor:pointer;display:flex;align-items:center;gap:4px;font-family:var(--font)}
+    .demo-btn:hover{background:var(--surface-2)}
+    .demo-dropdown{position:absolute;right:0;top:calc(100% + 4px);background:var(--bg);border:1px solid var(--border);border-radius:var(--radius);box-shadow:var(--shadow);min-width:220px;z-index:200;overflow:hidden}
+    .demo-dropdown a{display:block;padding:8px 14px;font-size:var(--fs-13);color:var(--text);text-decoration:none;border-bottom:1px solid var(--border)}
+    .demo-dropdown a:last-child{border-bottom:none}
+    .demo-dropdown a:hover{background:var(--surface-2)}
+    .demo-dropdown.hidden{display:none}
+
+    /* Main */
+    #main{max-width:1200px;margin:0 auto;padding:var(--s-5)}
+
+    /* Cards */
+    .card{background:var(--bg);border:1px solid var(--border);border-radius:var(--radius)}
+    .card-body{padding:var(--s-4)}
+    .card-header{padding:10px var(--s-4);border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;gap:var(--s-3)}
+    .card-title{font-size:var(--fs-14);font-weight:600;color:var(--text)}
+
+    /* Pills */
+    .pill{display:inline-flex;align-items:center;gap:4px;font-size:var(--fs-12);font-weight:500;padding:2px 8px;border-radius:9999px;white-space:nowrap;line-height:1.4}
+    .pill-neutral{background:var(--neutral-bg);color:var(--neutral)}
+    .pill-crit{background:var(--crit-bg);color:var(--crit)}
+    .pill-high{background:var(--high-bg);color:var(--high)}
+    .pill-watch{background:var(--watch-bg);color:var(--watch)}
+    .pill-ok{background:var(--ok-bg);color:var(--ok)}
+    .pill-accent{background:var(--accent-weak);color:var(--accent-text)}
+    .p0-dot{width:6px;height:6px;border-radius:9999px;background:currentColor;flex-shrink:0}
+
+    /* Buttons */
+    .btn{display:inline-flex;align-items:center;justify-content:center;gap:var(--s-2);font-size:var(--fs-14);font-weight:500;border-radius:var(--radius-sm);padding:8px 16px;cursor:pointer;border:none;transition:opacity .15s,background .15s;line-height:1;font-family:var(--font)}
+    .btn:disabled{opacity:.5;cursor:not-allowed}
+    .btn-primary{background:var(--accent);color:#fff}
+    .btn-primary:hover:not(:disabled){background:var(--accent-text)}
+    .btn-ok{background:var(--ok);color:#fff}
+    .btn-ok:hover:not(:disabled){background:#07703f}
+    .btn-secondary{background:var(--bg);color:var(--text);border:1px solid var(--border-2)}
+    .btn-secondary:hover:not(:disabled){background:var(--surface-2)}
+    .btn-ghost{background:none;color:var(--text-3);border:1px solid transparent}
+    .btn-ghost:hover:not(:disabled){background:var(--surface-2);color:var(--text-2)}
+    .btn-sm{padding:5px 10px;font-size:var(--fs-13)}
+    .btn-lg{padding:10px 20px;height:40px}
+    .btn-lg{padding:10px 20px;height:40px}
+    .btn:active:not(:disabled), .btn.active-sim:not(:disabled) { transform: translateY(1px); filter: brightness(0.9); }
+    button:focus-visible,a:focus-visible{outline:2px solid var(--accent);outline-offset:2px;border-radius:4px}
+    
+    /* Approve flow */
+    .btn-ok{position:relative;overflow:hidden;transition:all .3s}
+    .btn-ok.sending .approve-text{opacity:0;transform:translateY(-20px)}
+    .btn-ok.sending .approve-icon{opacity:1!important;transform:translate(0,0)!important}
+    @media(prefers-reduced-motion:reduce){
+      .btn-ok.sending .approve-text{opacity:0;transform:none}
+      .btn-ok.sending .approve-icon{opacity:1!important;transform:none!important}
+    }
+    #analysis-card{transition:border-color .3s}
+    #analysis-card.success-border{border-color:var(--ok)}
+
+    /* Stat tiles */
+    .stat-strip{display:grid;grid-template-columns:repeat(4,1fr);border:1px solid var(--border);border-radius:var(--radius);overflow:hidden;margin-bottom:var(--s-5);background:var(--bg)}
+    @media(max-width:640px){.stat-strip{grid-template-columns:1fr 1fr}}
+    .stat-tile{padding:var(--s-4);border-right:1px solid var(--border)}
+    .stat-tile:last-child{border-right:none}
+    .stat-label{font-size:var(--fs-12);font-weight:600;color:var(--text-3);text-transform:uppercase;letter-spacing:.05em;margin-bottom:var(--s-2)}
+    .stat-value{font-size:var(--fs-24);font-weight:600;font-variant-numeric:tabular-nums}
+
+    /* Table - scroll container approach so sticky thead works correctly */
+    .table-outer{overflow-x:auto;border:1px solid var(--border);border-radius:var(--radius);background:var(--bg)}
+    .table-inner{overflow-y:auto;max-height:calc(100vh - 300px)}
+    table{width:100%;border-collapse:collapse;font-size:var(--fs-14);min-width:700px}
+    thead th{
+      position:sticky;top:0;
+      background:var(--surface-2);
+      font-size:var(--fs-12);font-weight:600;color:var(--text-2);
+      text-transform:uppercase;letter-spacing:.04em;
+      padding:10px 14px;text-align:left;
+      border-bottom:2px solid var(--border);
+      white-space:nowrap;user-select:none;cursor:pointer;
+      z-index:2;
+    }
+    thead th.right{text-align:right}
+    .sort-icon{display:inline-block;margin-left:4px;opacity:.35;font-style:normal}
+    thead th.sort-active .sort-icon{opacity:1;color:var(--accent)}
+    tbody tr{height:48px;border-bottom:1px solid var(--border);cursor:pointer;transition:background .1s}
+    tbody tr:last-child{border-bottom:none}
+    tbody tr:hover,tbody tr:focus{background:var(--surface-2);outline:none}
+    tbody td{padding:10px 14px;vertical-align:middle}
+    tbody td.right{text-align:right}
+    .mini-bar{height:4px;border-radius:9999px;background:var(--surface-2);margin-top:5px;width:56px;overflow:hidden;margin-left:auto}
+    .mini-bar-fill{height:100%;border-radius:9999px;transition:width .3s}
+
+    /* Screen header */
+    .screen-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:var(--s-4);gap:var(--s-3);flex-wrap:wrap}
+    .screen-title{font-size:var(--fs-20);font-weight:600;color:var(--text);display:flex;align-items:baseline;gap:var(--s-2)}
+    .screen-count{font-size:var(--fs-14);font-weight:400;color:var(--text-3)}
+    .screen-controls{display:flex;align-items:center;gap:var(--s-3);flex-wrap:wrap}
+    .seg{display:flex;background:var(--surface-2);border:1px solid var(--border);border-radius:var(--radius-sm);padding:2px;gap:2px}
+    .seg-btn{padding:4px 12px;border-radius:4px;border:none;background:none;font-size:var(--fs-13);color:var(--text-2);cursor:pointer;font-family:var(--font)}
+    .seg-btn.active{background:var(--bg);color:var(--text);font-weight:500;box-shadow:0 1px 2px rgba(16,24,40,.08)}
+    .seg-btn:hover:not(.active){background:var(--border)}
+    select.sort-select{font-size:var(--fs-13);color:var(--text-2);background:var(--bg);border:1px solid var(--border);border-radius:var(--radius-sm);padding:5px 10px;cursor:pointer;font-family:var(--font)}
+    select.sort-select:focus{outline:2px solid var(--accent);outline-offset:1px}
+
+    /* Skeleton / shimmer */
+    @keyframes shimmer{0%{background-position:-400px 0}100%{background-position:400px 0}}
+    @media(prefers-reduced-motion:reduce){.shimmer{animation:none!important;background:var(--surface-2)!important}}
+    .shimmer{background:linear-gradient(90deg,var(--surface-2) 25%,var(--border) 50%,var(--surface-2) 75%);background-size:800px 100%;animation:shimmer 1.4s ease-in-out infinite;border-radius:4px}
+    .skel-row td{padding:14px}
+
+    /* Alerts */
+    .alert{padding:var(--s-3) var(--s-4);border-radius:var(--radius-sm);font-size:var(--fs-13);display:flex;align-items:center;gap:var(--s-3);flex-wrap:wrap}
+    .alert-error{background:var(--crit-bg);color:var(--crit);border:1px solid #fecdca}
+    .alert-warn{background:var(--high-bg);color:var(--high);border:1px solid #fedf89}
+    .alert-ok{background:var(--ok-bg);color:var(--ok);border:1px solid #abefc6}
+
+    /* Toast */
+    #toast-container{position:fixed;bottom:24px;right:24px;z-index:9999;display:flex;flex-direction:column;gap:8px}
+    .toast{padding:10px 16px;border-radius:var(--radius-sm);font-size:var(--fs-13);font-weight:500;min-width:180px;box-shadow:var(--shadow);animation:toastIn .2s ease}
+    @keyframes toastIn{from{transform:translateY(8px);opacity:0}to{transform:translateY(0);opacity:1}}
+    .toast-ok{background:var(--ok);color:#fff}
+    .toast-err{background:var(--crit);color:#fff}
+    .toast-info{background:var(--text);color:#fff}
+
+    /* 360 Layout */
+    .c360-grid{display:grid;gap:var(--s-5);grid-template-columns:7fr 5fr;align-items:start}
+    @media(max-width:1023px){.c360-grid{grid-template-columns:1fr}.c360-right{order:-1}}
+
+    /* Identity */
+    .id-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:var(--s-3) var(--s-5)}
+    @media(max-width:600px){.id-grid{grid-template-columns:1fr 1fr}}
+    .id-label{font-size:var(--fs-12);color:var(--text-3);margin-bottom:2px}
+    .id-value{font-size:var(--fs-14);font-weight:600}
+
+    /* Dual score */
+    .dual-score{display:grid;grid-template-columns:1fr 1fr}
+    .score-col{padding:var(--s-4)}
+    .score-col:first-child{border-right:1px solid var(--border)}
+    .score-label{font-size:var(--fs-12);font-weight:600;color:var(--text-3);text-transform:uppercase;letter-spacing:.04em;margin-bottom:var(--s-2)}
+    .score-big{font-size:var(--fs-24);font-weight:600;font-variant-numeric:tabular-nums;margin-bottom:var(--s-1)}
+    .score-caption{font-size:var(--fs-12);color:var(--text-3);margin-bottom:var(--s-3)}
+    .score-bar8{height:8px;border-radius:9999px;background:var(--surface-2);overflow:hidden;margin-bottom:var(--s-3)}
+    .score-bar8-fill{height:100%;border-radius:9999px}
+    .how-toggle{font-size:var(--fs-12);color:var(--accent-text);background:none;border:none;cursor:pointer;padding:0;font-family:var(--font)}
+    .how-toggle:hover{text-decoration:underline}
+    .how-panel{margin-top:var(--s-3);display:none}
+    .how-panel.open{display:block}
+    .method-agree-strip{padding:var(--s-3) var(--s-4);font-size:var(--fs-13);display:flex;align-items:center;gap:var(--s-2);border-top:1px solid var(--border)}
+
+    /* Diverging bars */
+    .div-bar-wrap{position:relative;height:6px;background:var(--surface-2);border-radius:9999px;margin-top:3px;overflow:visible}
+    .div-bar-center{position:absolute;left:50%;top:0;width:1px;height:100%;background:var(--border-2)}
+    .div-bar-fill{position:absolute;top:0;height:100%;border-radius:9999px}
+
+    /* ML features */
+    .ml-feat-row{display:flex;align-items:center;gap:8px;padding:4px 0;font-size:var(--fs-13);border-bottom:1px solid var(--border)}
+    .ml-feat-row:last-child{border-bottom:none}
+    .ml-feat-name{color:var(--text-2);flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+    .ml-feat-val{color:var(--text-3);font-size:var(--fs-12);white-space:nowrap}
+    .ml-feat-bar-wrap{width:56px;height:6px;background:var(--surface-2);border-radius:9999px;overflow:hidden;flex-shrink:0}
+    .ml-feat-bar-fill{height:100%;border-radius:9999px}
+
+    /* Sparkline */
+    svg.sparkline{display:block;width:100%;height:48px}
+
+    /* Feedback */
+    .fb-item{padding:var(--s-3) 0;border-bottom:1px solid var(--border)}
+    .fb-item:last-child{border-bottom:none}
+    .fb-row{display:flex;align-items:center;gap:var(--s-2);margin-bottom:var(--s-1);flex-wrap:wrap}
+    .fb-text{font-size:var(--fs-13);color:var(--text-2);line-height:1.5}
+
+    /* Analysis card */
+    .analyze-empty{padding:var(--s-5);text-align:center}
+    .analyze-desc{font-size:var(--fs-13);color:var(--text-2);margin-bottom:var(--s-5);line-height:1.6;max-width:280px;margin-left:auto;margin-right:auto}
+    .analyze-caption{font-size:var(--fs-12);color:var(--text-3);margin-top:var(--s-2)}
+
+    /* Ticker */
+    .ticker{margin-top:var(--s-4);display:flex;flex-direction:column;gap:var(--s-2)}
+    .ticker-step{font-size:var(--fs-13);color:var(--text-3);display:flex;align-items:center;gap:var(--s-2);transition:color .3s}
+    .ticker-step.active{color:var(--accent-text);font-weight:500}
+    .ticker-step.done{color:var(--ok)}
+    @media(prefers-reduced-motion:reduce){.ticker-step{transition:none!important}}
+    .tick-icon{width:16px;height:16px;flex-shrink:0}
+
+    /* Draft */
+    .draft-wrap{margin-top:var(--s-4)}
+    .draft-label-row{display:flex;align-items:center;justify-content:space-between;margin-bottom:var(--s-2)}
+    
+    /* Roadmap SVG */
+    @keyframes flow { from{offset-distance:0%} to{offset-distance:100%} }
+    .flow-dot { animation: flow 1.8s linear infinite; }
+    @media(prefers-reduced-motion:reduce) { .flow-dot { display: none !important; } .rm-node { transition: none !important; opacity: 1 !important; } }
+    .rm-node { opacity: 0; transition: opacity 0.4s; }
+    .rm-node.in { opacity: 1; }
+    .rm-box { stroke: var(--accent); stroke-dasharray: 4; fill: var(--accent-weak); opacity: 0.4; stroke-width: 1.5; }
+    .rm-svg-wrap { overflow-x: auto; padding: 24px; text-align: center; }
+    .rm-caption { font-size: var(--fs-12); color: var(--text-3); text-align: center; padding: 16px; border-top: 1px solid var(--border); }
+    .rm-table { width: 100%; border-collapse: collapse; font-size: var(--fs-13); text-align: left; }
+    .rm-table th, .rm-table td { padding: 10px 12px; border-bottom: 1px solid var(--border); }
+    .rm-table th { font-weight: 600; color: var(--text); }
+    .rm-table tr:last-child td { border-bottom: none; }
+    .io-card { background: var(--surface); padding: 12px; border-radius: var(--radius-sm); font-family: monospace; font-size: var(--fs-12); white-space: pre-wrap; color: var(--text-2); flex: 1; border: 1px solid var(--border); text-align: left;}
+    
+    /* Modals */
+    .modal-overlay{position:fixed;inset:0;background:rgba(16,24,40,.4);backdrop-filter:blur(2px);display:flex;align-items:center;justify-content:center;z-index:999;padding:var(--s-4)}
+    .modal-box{background:var(--bg);border-radius:var(--radius);box-shadow:0 10px 15px -3px rgba(16,24,40,.1),0 4px 6px -4px rgba(16,24,40,.05);width:100%;max-width:500px;max-height:calc(100vh - 48px);overflow-y:auto}
+    .modal-overlay.hidden{display:none}
+
+    /* Button active state */
+    .btn.active-sim{background:var(--accent-text);transform:scale(0.98)}
+    .draft-label{font-size:var(--fs-13);font-weight:600;color:var(--text)}
+    .char-count{font-size:var(--fs-12);color:var(--text-3);font-variant-numeric:tabular-nums}
+    textarea.draft{width:100%;min-height:160px;border:1px solid var(--border);border-radius:var(--radius-sm);padding:var(--s-3);font-size:var(--fs-13);line-height:1.6;font-family:var(--font);color:var(--text);resize:vertical;background:var(--bg)}
+    textarea.draft:focus{outline:2px solid var(--accent);outline-offset:0}
+
+    /* Approve bar */
+    .approve-bar{display:flex;align-items:center;gap:var(--s-2);padding:var(--s-3) var(--s-4);border-top:1px solid var(--border);flex-wrap:wrap}
+    .approve-status{font-size:var(--fs-12);color:var(--text-3);margin-left:auto}
+    .dismiss-confirm{display:flex;align-items:center;gap:var(--s-2);font-size:var(--fs-13);color:var(--text-2)}
+
+    /* Escalate */
+    .escalate-strip{display:flex;align-items:center;gap:var(--s-2);padding:var(--s-3) var(--s-4);background:var(--crit-bg);border-bottom:1px solid #fecdca;font-size:var(--fs-13);font-weight:500;color:var(--crit)}
+
+    /* Breadcrumb */
+    .breadcrumb{display:flex;align-items:center;gap:var(--s-3);margin-bottom:var(--s-4);flex-wrap:wrap}
+    .breadcrumb a{font-size:var(--fs-13);color:var(--accent-text);text-decoration:none}
+    .breadcrumb a:hover{text-decoration:underline}
+    .breadcrumb-title{font-size:var(--fs-24);font-weight:600;color:var(--text)}
+    .breadcrumb-meta{display:flex;align-items:center;gap:var(--s-2);flex-wrap:wrap}
+
+    /* Summary / action */
+    .summary-text{font-size:var(--fs-14);color:var(--text-2);line-height:1.6;margin-bottom:var(--s-3)}
+    .reasons-list{padding-left:0;list-style:none;margin-bottom:var(--s-3)}
+    .reasons-list li{font-size:var(--fs-13);color:var(--text-2);padding:3px 0 3px var(--s-4);position:relative}
+    .reasons-list li::before{content:"-";position:absolute;left:0;color:var(--text-3)}
+    .action-section{margin-bottom:var(--s-3)}
+    .action-label{font-size:var(--fs-13);font-weight:600;color:var(--text);margin-bottom:var(--s-1)}
+    .action-text{font-size:var(--fs-13);color:var(--text-2);line-height:1.6}
+    .genby{font-size:var(--fs-12);color:var(--text-3)}
+    .playbook-chip{display:inline-flex;align-items:center;font-size:var(--fs-12);background:var(--accent-weak);color:var(--accent-text);border-radius:9999px;padding:1px 8px;cursor:pointer;border:none;font-family:var(--font);text-decoration:underline;text-decoration-style:dotted}
+    .rerun-link{font-size:var(--fs-12);color:var(--text-3);background:none;border:none;cursor:pointer;text-decoration:underline;font-family:var(--font);padding:0}
+    .rerun-link:hover{color:var(--accent-text)}
+
+    /* Playbook */
+    .playbook-text{font-size:var(--fs-13);color:var(--text-2);line-height:1.65;background:var(--surface);padding:var(--s-3);border-radius:var(--radius-sm);margin-top:var(--s-3);white-space:pre-wrap;word-break:break-word}
+
+    /* Modals */
+    .modal-overlay{position:fixed;inset:0;background:rgba(16,24,40,.3);z-index:500;display:flex;align-items:center;justify-content:center}
+    .modal-overlay.hidden{display:none}
+    .modal-box{background:var(--bg);border:1px solid var(--border);border-radius:var(--radius);box-shadow:var(--shadow);padding:var(--s-5);max-width:440px;width:90%}
+    .modal-title{font-size:var(--fs-16);font-weight:600;margin-bottom:var(--s-4)}
+    .shortcut-table{width:100%;font-size:var(--fs-13);border-collapse:collapse}
+    .shortcut-table td{padding:5px 0;color:var(--text-2)}
+    .shortcut-table td:first-child{color:var(--text-3);width:110px}
+    kbd{font-size:var(--fs-12);background:var(--surface-2);border:1px solid var(--border);border-radius:4px;padding:1px 6px;font-family:var(--font)}
+    .health-kv{display:flex;justify-content:space-between;padding:4px 0;border-bottom:1px solid var(--border);font-size:var(--fs-13);gap:16px}
+    .health-kv:last-child{border-bottom:none}
+    .health-kv span:last-child{color:var(--text-3);word-break:break-all;text-align:right}
+    
+    /* How It Works Modal */
+    .how-tabs{display:flex;border-bottom:1px solid var(--border);padding:0 var(--s-5);background:var(--surface-2)}
+    .how-tab{background:none;border:none;padding:12px 16px;font-size:var(--fs-14);font-weight:500;color:var(--text-2);cursor:pointer;border-bottom:2px solid transparent;margin-bottom:-1px;font-family:var(--font)}
+    .how-tab:hover{color:var(--text)}
+    .how-tab.active{color:var(--accent);border-bottom-color:var(--accent)}
+    .how-tab-pane{display:none;padding:var(--s-5)}
+    .how-tab-pane.active{display:block}
+    .pipeline-flow{display:flex;align-items:flex-start;gap:8px;position:relative}
+    @media(max-width:899px){.pipeline-flow{flex-direction:column}}
+    .stage-card{flex:1;min-width:0;background:var(--bg);border:1px solid var(--border);border-radius:var(--radius-sm);padding:12px;text-align:left;opacity:0;transform:translateY(10px);transition:opacity .4s ease,transform .4s ease;z-index:2;position:relative}
+    .stage-card.in{opacity:1;transform:translateY(0)}
+    @media(prefers-reduced-motion:reduce){.stage-card{transition:none!important;opacity:1!important;transform:none!important}}
+    .stage-icon{color:var(--text-3);margin-bottom:8px}
+    .stage-title{font-size:var(--fs-13);font-weight:600;color:var(--text);margin-bottom:4px}
+    .stage-desc{font-size:var(--fs-12);color:var(--text-3);line-height:1.4}
+    .pipeline-track{position:absolute;top:32px;left:0;right:0;height:2px;background:var(--surface-2);z-index:1;overflow:hidden}
+    @media(max-width:899px){.pipeline-track{display:none}}
+    .pipeline-dot{width:4px;height:4px;background:var(--accent-weak);border-radius:50%;position:absolute;top:-1px;left:0;animation:travel 1.6s infinite linear}
+    .pipeline-dot:nth-child(2){animation-delay:.8s}
+    @keyframes travel{from{transform:translateX(-10px)}to{transform:translateX(700px)}}
+    @media(prefers-reduced-motion:reduce){.pipeline-dot{display:none}}
+    .pipeline-prog-wrap{height:3px;background:var(--surface-2);border-radius:99px;margin-top:16px;overflow:hidden;position:relative}
+    .pipeline-prog-fill{height:100%;background:var(--accent);width:0;transition:width 2.1s ease-out}
+    .pipeline-prog-fill.in{width:100%}
+    @media(prefers-reduced-motion:reduce){.pipeline-prog-fill.in{transition:none}}
+    .thresh-grid{display:grid;grid-template-columns:1fr;gap:0;border-top:1px solid var(--border)}
+    .thresh-row{display:grid;grid-template-columns:140px 1fr;gap:16px;padding:10px 0;border-bottom:1px solid var(--border);font-size:var(--fs-13);align-items:baseline}
+    .thresh-label{font-weight:600;color:var(--text)}
+    .thresh-val{color:var(--text-2);line-height:1.5}
+
+    /* Footer */
+    footer{text-align:center;font-size:var(--fs-12);color:var(--text-3);padding:var(--s-5) var(--s-5) var(--s-6)}
+
+    /* Misc */
+    .empty-state{text-align:center;padding:var(--s-6);color:var(--text-3);font-size:var(--fs-14)}
+    .sr-only{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap}
+    .mb4{margin-bottom:var(--s-4)}
+  </style>
+</head>
+<body>
+
+<!-- TOP BAR -->
+<header id="topbar" role="banner">
+  <a href="#/" class="brand" id="logo-link">
+    <svg width="24" height="24" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+      <path d="M12 2L4 6v6c0 5.25 3.4 10.15 8 11.35C16.6 22.15 20 17.25 20 12V6L12 2z" fill="#2563eb"/>
+      <path d="M10.4 15.4L7.6 12.6l1.2-1.2 1.6 1.6 3.2-3.2 1.2 1.2-4.4 4.4z" fill="#fff"/>
+    </svg>
+    Churn Risk Agent
+  </a>
+  <div class="spacer"></div>
+  <div class="topbar-right">
+    <div class="demo-menu" id="health-menu">
+      <button class="health-dot" id="health-btn" aria-label="System health" aria-haspopup="true" aria-expanded="false">
+        <span class="dot" id="health-indicator"></span>
+        <span id="health-label">System healthy</span>
+      </button>
+      <div class="demo-dropdown hidden" id="health-popover" role="menu" style="right:0;width:280px;cursor:default;white-space:normal">
+        <div style="font-weight:600;margin-bottom:8px">System status</div>
+        <div id="health-popover-body" style="font-size:var(--fs-13);color:var(--text-2)">Loading...</div>
+      </div>
+    </div>
+    <div class="demo-menu">
+      <button class="demo-btn" id="demo-toggle" aria-haspopup="true" aria-expanded="false">Demo &#9660;</button>
+      <div class="demo-dropdown hidden" id="demo-dropdown" role="menu">
+        <a href="#/customer/3767" role="menuitem">#3767 &mdash; Critical (P0)</a>
+        <a href="#/customer/4837" role="menuitem">#4837 &mdash; Low risk</a>
+      </div>
+    </div>
+    <button class="btn btn-ghost btn-sm" id="signout-btn" style="display:none;padding:4px 8px;font-size:var(--fs-13)">Sign out</button>
+    <button class="btn btn-ghost btn-sm" id="roadmap-btn" style="color:var(--accent-text);font-size:var(--fs-13);display:flex;align-items:center;gap:4px">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><line x1="8.59" y1="13.51" x2="15.42" y2="17.49"/><line x1="15.41" y1="6.51" x2="8.59" y2="10.49"/></svg>
+      Automation roadmap
+    </button>
+    <button class="btn btn-ghost btn-sm" id="how-btn" style="color:var(--accent-text);font-size:var(--fs-13)">How it works</button>
+  </div>
+</header>
+
+<!-- MAIN -->
+<main id="main" role="main"></main>
+
+<!-- FOOTER -->
+<footer role="contentinfo">
+  Deterministic health score + XGBoost churn model + RAG-grounded LLM recommendation.
+</footer>
+
+<!-- TOAST -->
+<div id="toast-container" aria-live="polite" aria-atomic="true"></div>
+
+<!-- ROADMAP MODAL -->
+<div class="modal-overlay hidden" id="roadmap-modal" role="dialog" aria-modal="true" aria-labelledby="roadmap-title">
+  <div class="modal-box" style="max-width:920px;padding:0;overflow:hidden;display:flex;flex-direction:column">
+    <div style="padding:var(--s-4) var(--s-5);border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center">
+      <h2 class="modal-title" id="roadmap-title" style="margin:0">Automation roadmap &mdash; n8n orchestration</h2>
+      <button class="btn btn-ghost btn-sm" id="roadmap-close-x" style="padding:4px;line-height:1;margin:-4px">&times;</button>
+    </div>
+    <div class="how-tabs" id="roadmap-tabs-strip">
+      <button class="how-tab active" data-rtab="architecture">Architecture</button>
+      <button class="how-tab" data-rtab="daily">Daily workflow</button>
+      <button class="how-tab" data-rtab="event">Event-driven</button>
+      <button class="how-tab" data-rtab="agent">Agent brain</button>
+      <button class="how-tab" data-rtab="who">Who does what</button>
+      <button class="how-tab" data-rtab="live">Live vs roadmap</button>
+    </div>
+    <div class="how-content" id="roadmap-content" style="flex:1;overflow-y:auto;background:var(--bg)"></div>
+    <div style="padding:16px 20px;background:var(--surface-2);font-size:12.5px;color:var(--text-2);border-top:1px solid var(--border);text-align:center;font-style:italic">
+      "Everything in this blueprint runs today as an in-process Python pipeline (orchestrator.py). n8n adds scheduling, event triggers, retries, integrations (Slack / email / CRM), and a visual operations canvas &mdash; without moving business logic out of the backend."
+    </div>
+  </div>
+</div>
+
+<!-- HOW IT WORKS MODAL -->
+<div class="modal-overlay hidden" id="how-modal" role="dialog" aria-modal="true" aria-labelledby="how-title">
+  <div class="modal-box" style="max-width:720px;padding:0;overflow:hidden">
+    <div style="padding:var(--s-4) var(--s-5);border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center">
+      <h2 class="modal-title" id="how-title" style="margin:0">How the Churn Risk Agent works</h2>
+      <button class="btn btn-ghost btn-sm" id="how-close-x" style="padding:4px;line-height:1;margin:-4px">&times;</button>
+    </div>
+    
+    <div class="how-tabs">
+      <button class="how-tab active" data-tab="pipeline">Pipeline</button>
+      <button class="how-tab" data-tab="thresholds">Thresholds</button>
+      <button class="how-tab" data-tab="shortcuts">Shortcuts</button>
+    </div>
+
+    <div class="how-content">
+      <div id="tab-pipeline" class="how-tab-pane active">
+        <div class="pipeline-flow">
+          <div class="pipeline-track"><div class="pipeline-dot"></div><div class="pipeline-dot"></div></div>
+          <div class="stage-card">
+            <div class="stage-icon"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3"/></svg></div>
+            <div class="stage-title">Ingest</div>
+            <div class="stage-desc">~10,000 accounts: usage, billing, support, engagement, feedback</div>
+          </div>
+          <div class="stage-card">
+            <div class="stage-icon"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/><path d="M2 12h20"/></svg></div>
+            <div class="stage-title">Features</div>
+            <div class="stage-desc">40+ signals per account: tenure, usage trend, payment failures, sentiment, and support tickets</div>
+          </div>
+          <div class="stage-card">
+            <div class="stage-icon"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M2 20h20M5 20v-4M9 20v-8M13 20v-12M17 20v-16"/></svg></div>
+            <div class="stage-title">ML model</div>
+            <div class="stage-desc">XGBoost predicts probability of churn &middot; ROC-AUC 0.88</div>
+          </div>
+          <div class="stage-card">
+            <div class="stage-icon"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg></div>
+            <div class="stage-title">Health score</div>
+            <div class="stage-desc">Transparent 0&ndash;100 score from weighted, explainable factors</div>
+          </div>
+          <div class="stage-card">
+            <div class="stage-icon"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"/></svg></div>
+            <div class="stage-title">RAG</div>
+            <div class="stage-desc">Semantic match against 10 retention playbooks</div>
+          </div>
+          <div class="stage-card">
+            <div class="stage-icon"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/></svg></div>
+            <div class="stage-title">LLM</div>
+            <div class="stage-desc">Gemini drafts grounded, personalized outreach</div>
+          </div>
+        </div>
+        <div class="pipeline-prog-wrap"><div class="pipeline-prog-fill" id="pipe-prog"></div></div>
+        <div style="margin-top:16px;font-size:var(--fs-13);color:var(--text-2);text-align:center;font-style:italic">
+          Two independent methods score every account &mdash; a rule-based health score you can audit, and an ML churn probability. The LLM only elaborates; it never changes the recommended action or priority.
+        </div>
+      </div>
+      
+      <div id="tab-thresholds" class="how-tab-pane">
+        <div class="thresh-grid">
+          <div class="thresh-row">
+            <div class="thresh-label">Health Score (Rules)</div>
+            <div class="thresh-val">
+              <span class="pill pill-ok">Healthy (70&ndash;100)</span> &middot;
+              <span class="pill pill-watch">Watch (50&ndash;69)</span> &middot;
+              <span class="pill pill-high">At Risk (30&ndash;49)</span> &middot;
+              <span class="pill pill-crit">Critical (0&ndash;29)</span>
+            </div>
+          </div>
+          <div class="thresh-row">
+            <div class="thresh-label">Churn Model (ML)</div>
+            <div class="thresh-val">
+              <span class="pill pill-crit">&ge; 70%</span> triggers P0 workflow<br>
+              <span class="pill pill-high">40&ndash;69%</span> triggers P1 workflow<br>
+              <span class="pill pill-neutral">&le; 39%</span> ignores ML workflow (unless health is critical)
+            </div>
+          </div>
+          <div class="thresh-row">
+            <div class="thresh-label">Routing Priority</div>
+            <div class="thresh-val">
+              <strong>P0 (Critical)</strong> &mdash; Needs immediate CSM intervention. Triggered by high ML churn probability + drop in usage.<br>
+              <strong>P1 (High)</strong> &mdash; Standard risk. Triggered by support tickets, sentiment, or moderate ML score.<br>
+              <strong>P2 (Medium)</strong> &mdash; Low risk, requires light touch.<br>
+              <strong>P3 (Low)</strong> &mdash; Healthy accounts.
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div id="tab-shortcuts" class="how-tab-pane">
+        <table class="shortcut-table" style="margin-top:0"><tbody>
+          <tr><td><kbd>/</kbd></td><td>Focus sort control (dashboard)</td></tr>
+          <tr><td><kbd>j</kbd> / <kbd>k</kbd></td><td>Move row selection up / down</td></tr>
+          <tr><td><kbd>Enter</kbd></td><td>Open selected account</td></tr>
+          <tr><td><kbd>a</kbd></td><td>Analyze account (Customer 360)</td></tr>
+          <tr><td><kbd>Esc</kbd></td><td>Back to dashboard / close modal</td></tr>
+          <tr><td><kbd>?</kbd></td><td>Toggle this modal</td></tr>
+        </tbody></table>
+      </div>
+    </div>
+    
+    <div style="padding:var(--s-4) var(--s-5);border-top:1px solid var(--border);display:flex;justify-content:space-between;align-items:center;background:var(--surface-2)">
+      <label style="display:flex;align-items:center;gap:8px;font-size:var(--fs-13);color:var(--text-2);cursor:pointer">
+        <input type="checkbox" id="how-dont-show"> Don't show this on sign-in
+      </label>
+      <button class="btn btn-primary" id="how-close">Got it</button>
+    </div>
+  </div>
+</div>
+
+
+<script>
+'use strict';
+
+// â”€â”€ STATE
+var S = {
+  dashboard: null, currentDetail: null,
+  dashFilter: 'all', dashSort: 'churn', dashSortDir: 'desc',
+  selectedRow: -1, analysisId: null, editedDraft: null, currentCid: null,
+};
+
+// â”€â”€ API
+function ApiError(status, text) { this.status = status; this.message = text; }
+async function api(path, opts) {
+  opts = opts || {};
+  opts.credentials = 'include';
+  var r = await fetch(path, Object.assign({ headers: { 'Content-Type': 'application/json' } }, opts));
+  if (!r.ok) { 
+    if (r.status === 401 && path !== '/api/login' && path !== '/api/me') {
+      if (typeof renderLogin === 'function') renderLogin();
+      throw new ApiError(r.status, "Unauthorized");
+    }
+    var t = await r.text().catch(function(){ return r.statusText; }); 
+    throw new ApiError(r.status, t); 
+  }
+  return r.json();
+}
+
+// â”€â”€ FORMAT HELPERS  (only ASCII in string literals)
+function fmtMoney(x) { return '$' + Math.round(x).toLocaleString(); }
+function fmtPct(x)   { return Math.round(x * 100) + '%'; }
+var DASH = '\u2014';   // em dash, declared once
+
+function relDays(days) {
+  if (days == null) return '<span title="No upcoming renewal date found">N/A</span>';
+  if (days <= 0)    return 'expired';
+  return 'in ' + days + 'd';
+}
+function relDaysStyle(days) {
+  if (days == null || days > 60) return '';
+  return days <= 30 ? 'color:var(--crit)' : 'color:var(--high)';
+}
+function tenureLabel(days) {
+  if (days == null) return DASH;
+  return days < 30 ? days + 'd' : Math.round(days / 30) + ' mo';
+}
+function lastLoginLabel(days) {
+  if (days == null) return DASH;
+  if (days === 0)   return 'today';
+  return days + 'd ago';
+}
+
+function bandColor(b) {
+  return { critical:'var(--crit)', at_risk:'var(--high)', watch:'var(--watch)', healthy:'var(--ok)' }[b] || 'var(--text-3)';
+}
+function bandPillCls(b) {
+  return { critical:'pill-crit', at_risk:'pill-high', watch:'pill-watch', healthy:'pill-ok' }[b] || 'pill-neutral';
+}
+function bandLabel(b) {
+  return { critical:'Critical', at_risk:'At risk', watch:'Watch', healthy:'Healthy' }[b] || (b || DASH);
+}
+function prioPillCls(p) {
+  return { P0:'pill-crit', P1:'pill-high', P2:'pill-neutral', P3:'pill-neutral' }[p] || 'pill-neutral';
+}
+function planPillCls(p) {
+  return { Premium:'pill-crit', Standard:'pill-accent', Basic:'pill-neutral' }[p] || 'pill-neutral';
+}
+function genByLabel(g) {
+  if (!g) return 'Unknown';
+  if (g.startsWith('gemini') || g.indexOf('gemini') >= 0) return 'AI (Gemini) \u00b7 grounded in playbook + signals';
+  if (g === 'fallback' || g.indexOf('fallback') >= 0)     return 'Template (LLM unavailable)';
+  if (g === 'low_risk_shortcut')                          return 'Rule-based \u00b7 low risk, LLM skipped';
+  return g;
+}
+function healthBand(s) {
+  return s >= 70 ? 'healthy' : s >= 50 ? 'watch' : s >= 30 ? 'at_risk' : 'critical';
+}
+
+// â”€â”€ ESCAPE
+function esc(s) {
+  return String(s == null ? '' : s)
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+// â”€â”€ DOM
+function $id(id) { return document.getElementById(id); }
+function setMain(h) { $id('main').innerHTML = h; }
+
+function toast(msg, kind) {
+  kind = kind || 'ok';
+  var c = $id('toast-container');
+  var t = document.createElement('div');
+  t.className = 'toast toast-' + kind;
+  t.textContent = msg;
+  c.appendChild(t);
+  setTimeout(function(){ t.remove(); }, 3500);
+}
+
+// â”€â”€ SPARKLINE
+function sparkline(points) {
+  if (!points || !points.length) return '<svg class="sparkline" viewBox="0 0 400 48"></svg>';
+  var W = 400, H = 48, pad = 4;
+  var min = Math.min.apply(null, points), max = Math.max.apply(null, points);
+  var rng = max - min || 1;
+  var pts = points.map(function(v, i) {
+    return [
+      pad + (i / (points.length - 1)) * (W - 2*pad),
+      pad + (1 - (v - min) / rng) * (H - 2*pad)
+    ];
+  });
+  var poly = pts.map(function(p){ return p.join(','); }).join(' ');
+  var area = pts.reduce(function(a, p, i){ return a + (i===0 ? 'M'+p[0]+','+p[1] : 'L'+p[0]+','+p[1]); }, '')
+    + ' L' + pts[pts.length-1][0] + ',' + H + ' L' + pts[0][0] + ',' + H + ' Z';
+  var lx = pts[pts.length-1][0], ly = pts[pts.length-1][1];
+  return '<svg class="sparkline" viewBox="0 0 '+W+' '+H+'" preserveAspectRatio="none" aria-hidden="true">'
+    + '<defs><linearGradient id="sg" x1="0" y1="0" x2="0" y2="1">'
+    + '<stop offset="0%" stop-color="var(--accent)" stop-opacity=".13"/>'
+    + '<stop offset="100%" stop-color="var(--accent)" stop-opacity="0"/>'
+    + '</linearGradient></defs>'
+    + '<path d="'+area+'" fill="url(#sg)"/>'
+    + '<polyline points="'+poly+'" fill="none" stroke="var(--accent)" stroke-width="1.5" stroke-linejoin="round"/>'
+    + '<circle cx="'+lx+'" cy="'+ly+'" r="3" fill="var(--accent)"/>'
+    + '</svg>';
+}
+
+// â”€â”€ SKELETON
+function skelRows(n) {
+  n = n || 8;
+  var out = '';
+  for (var i = 0; i < n; i++) {
+    out += '<tr class="skel-row">'
+      + '<td><div class="shimmer" style="height:14px;width:120px;margin-bottom:4px"></div><div class="shimmer" style="height:10px;width:60px"></div></td>'
+      + '<td><div class="shimmer" style="height:20px;width:60px;border-radius:9999px"></div></td>'
+      + '<td class="right"><div class="shimmer" style="height:14px;width:36px;margin-left:auto"></div></td>'
+      + '<td class="right"><div class="shimmer" style="height:14px;width:36px;margin-left:auto"></div></td>'
+      + '<td><div class="shimmer" style="height:20px;width:28px;border-radius:9999px"></div></td>'
+      + '<td><div class="shimmer" style="height:14px;width:160px"></div></td>'
+      + '<td class="right"><div class="shimmer" style="height:14px;width:40px;margin-left:auto"></div></td>'
+      + '</tr>';
+  }
+  return out;
+}
+
+// â”€â”€ DASHBOARD
+async function renderDashboard() {
+  S.currentCid = null;
+  setMain(
+    '<div class="screen-header">'
+    + '<div class="screen-title">Accounts <span class="screen-count" id="db-count">&middot; loading...</span></div>'
+    + '<div class="screen-controls">'
+    + '<div class="seg" role="group" aria-label="Filter">'
+    + '<button class="seg-btn active" data-filter="all">All</button>'
+    + '<button class="seg-btn" data-filter="risk">At risk</button>'
+    + '<button class="seg-btn" data-filter="p0">P0 only</button>'
+    + '</div>'
+    + '<label class="sr-only" for="sort-sel">Sort by</label>'
+    + '<select class="sort-select" id="sort-sel" aria-label="Sort by">'
+    + '<option value="churn">Sort: Churn risk &#9660;</option>'
+    + '<option value="health">Sort: Health</option>'
+    + '<option value="arr">Sort: ARR</option>'
+    + '<option value="renewal">Sort: Renewal</option>'
+    + '</select>'
+    + '</div></div>'
+    + '<div class="stat-strip">'
+    + '<div class="stat-tile"><div class="stat-label">At risk</div><div class="stat-value tabular" id="st-atrisk" style="color:var(--crit)">-</div></div>'
+    + '<div class="stat-tile"><div class="stat-label">P0 escalations</div><div class="stat-value tabular" id="st-p0" style="color:var(--crit)">-</div></div>'
+    + '<div class="stat-tile"><div class="stat-label">Avg health</div><div class="stat-value tabular" id="st-health">-</div></div>'
+    + '<div class="stat-tile"><div class="stat-label">ARR at risk</div><div class="stat-value tabular" id="st-arr">-</div></div>'
+    + '</div>'
+    + '<div class="table-outer"><div class="table-inner">'
+    + '<table id="acc-table" role="grid">'
+    + '<thead><tr>'
+    + '<th data-sort="name">Account</th>'
+    + '<th>Plan</th>'
+    + '<th class="right" data-sort="churn" title="Machine learning model prediction of churn probability">Churn risk<span class="sort-icon" id="si-churn"> &#9660;</span></th>'
+    + '<th class="right" data-sort="health" title="Rule-based deterministic health score (0-100)">Health<span class="sort-icon" id="si-health"></span></th>'
+    + '<th data-sort="priority" title="Escalation priority level">Priority</th>'
+    + '<th title="Most critical recent event or signal for this account">Top signal</th>'
+    + '<th class="right" data-sort="renewal" title="Days until next contract renewal">Renewal<span class="sort-icon" id="si-renewal"></span></th>'
+    + '</tr></thead>'
+    + '<tbody id="tbody">' + skelRows() + '</tbody>'
+    + '</table></div></div>'
+  );
+
+  // Wire seg buttons
+  document.querySelectorAll('.seg-btn').forEach(function(b) {
+    b.addEventListener('click', function() {
+      document.querySelectorAll('.seg-btn').forEach(function(x){ x.classList.remove('active'); });
+      b.classList.add('active');
+      S.dashFilter = b.dataset.filter;
+      S.selectedRow = -1;
+      renderRows();
+    });
+  });
+
+  // Wire sort select
+  var sel = $id('sort-sel');
+  sel.value = S.dashSort;
+  sel.addEventListener('change', function(e) {
+    S.dashSort = e.target.value; S.dashSortDir = 'desc'; renderRows();
+  });
+
+  // Wire thead clicks
+  document.querySelectorAll('thead th[data-sort]').forEach(function(th) {
+    th.addEventListener('click', function() {
+      var colMap = { name:'churn', churn:'churn', health:'health', priority:'churn', renewal:'renewal' };
+      var ns = colMap[th.dataset.sort] || th.dataset.sort;
+      if (S.dashSort === ns) S.dashSortDir = S.dashSortDir === 'desc' ? 'asc' : 'desc';
+      else { S.dashSort = ns; S.dashSortDir = 'desc'; }
+      var s2 = $id('sort-sel'); if (s2) s2.value = S.dashSort;
+      renderRows();
+    });
+  });
+
+  if (S.dashboard) { fillStats(S.dashboard); renderRows(); return; }
+
+  try {
+    S.dashboard = await api('/api/customers?demo_only=true');
+    fillStats(S.dashboard);
+    renderRows();
+  } catch(e) {
+    console.error('Dashboard load failed', e);
+    var tw = document.querySelector('.table-outer');
+    if (tw) tw.innerHTML = '<div class="alert alert-error" style="margin:16px">Could not load accounts. <button class="btn btn-secondary btn-sm" onclick="S.dashboard=null;renderDashboard()">Retry</button></div>';
+  }
+}
+
+function fillStats(rows) {
+  var atRisk = rows.filter(function(r){ return r.risk_band==='critical'||r.risk_band==='at_risk'; }).length;
+  var p0     = rows.filter(function(r){ return r.priority === 'P0'; }).length;
+  var avg    = rows.length ? Math.round(rows.reduce(function(s,r){ return s+r.health_score; },0)/rows.length) : 0;
+  var arrR   = rows.filter(function(r){ return r.risk_band==='critical'||r.risk_band==='at_risk'; }).reduce(function(s,r){ return s+r.arr; },0);
+  function set(id,v){ var e=$id(id); if(e) e.textContent=String(v); }
+  set('st-atrisk', atRisk);
+  set('st-p0', p0);
+  set('st-health', avg);
+  set('st-arr', fmtMoney(arrR));
+  var ce=$id('db-count'); if(ce) ce.textContent='\u00b7 '+rows.length+' accounts';
+}
+
+function renderRows() {
+  var tbody = $id('tbody');
+  if (!tbody || !S.dashboard) return;
+  var rows = S.dashboard.slice();
+  if (S.dashFilter==='risk') rows=rows.filter(function(r){ return r.risk_band==='critical'||r.risk_band==='at_risk'; });
+  if (S.dashFilter==='p0')   rows=rows.filter(function(r){ return r.escalate; });
+  var dir = S.dashSortDir==='desc' ? 1 : -1;
+  rows.sort(function(a,b) {
+    if (S.dashSort==='churn')   return dir*(b.churn_probability - a.churn_probability);
+    if (S.dashSort==='health')  return dir*(b.health_score - a.health_score);
+    if (S.dashSort==='arr')     return dir*(b.arr - a.arr);
+    if (S.dashSort==='renewal') return dir*((a.days_to_renewal==null?9999:a.days_to_renewal)-(b.days_to_renewal==null?9999:b.days_to_renewal));
+    return 0;
+  });
+
+  // Update sort icons (use up/down triangles via HTML entities)
+  ['churn','health','renewal'].forEach(function(c) {
+    var e=$id('si-'+c); if(!e) return;
+    e.innerHTML = S.dashSort===c ? (S.dashSortDir==='desc'?' &#9660;':' &#9650;') : '';
+  });
+  document.querySelectorAll('thead th[data-sort]').forEach(function(th) {
+    var colMap = { churn:'churn', health:'health', renewal:'renewal' };
+    th.classList.toggle('sort-active', colMap[th.dataset.sort] === S.dashSort);
+  });
+
+  if (!rows.length) {
+    tbody.innerHTML = '<tr><td colspan="7"><div class="empty-state">No accounts match this filter.</div></td></tr>';
+    return;
+  }
+
+  var html = rows.map(function(r, idx) {
+    var pct  = Math.round(r.churn_probability * 100);
+    var bc   = bandColor(r.risk_band);
+    var hbc  = bandColor(healthBand(r.health_score));
+    var rStr = relDays(r.days_to_renewal);
+    var rSty = relDaysStyle(r.days_to_renewal);
+    var p0Dot = r.priority === 'P0' ? '<span class="p0-dot"></span>' : '';
+    var pPill = '<span class="pill '+prioPillCls(r.priority)+'">'+p0Dot+esc(r.priority)+'</span>';
+    var plPill= '<span class="pill '+planPillCls(r.plan_tier)+'">'+esc(r.plan_tier||DASH)+'</span>';
+    var sigRaw = r.top_reason && r.top_reason.trim() ? r.top_reason : null;
+    if (sigRaw && sigRaw.indexOf('-100% vs baseline') >= 0) sigRaw = sigRaw.replace('-100% vs baseline', 'no usage in last 7 days');
+    var sig  = sigRaw ? esc(sigRaw) : '<span title="No critical signals detected for this account" style="color:var(--text-3);font-style:italic">No data</span>';
+    var sigTitle = sigRaw ? esc(sigRaw) : 'No critical signals detected';
+    
+    var mlHigh = r.churn_probability >= 0.70;
+    var hlHigh = r.health_score >= 70;
+    if ((mlHigh && hlHigh) || (r.churn_probability <= 0.30 && r.health_score <= 40)) {
+      sig = '<span class="pill pill-high" style="padding:1px 6px;font-size:var(--fs-11);margin-right:6px;border-radius:4px" title="ML and rule-based views disagree &mdash; review"><svg width="10" height="10" viewBox="0 0 14 14" fill="currentColor" style="display:inline;vertical-align:-1px;margin-right:3px"><path d="M7 0L0 12h14L7 0zm0 10.5c-.55 0-1-.45-1-1s.45-1 1-1 1 .45 1 1-.45 1-1 1zm-1-3V4.5h2v3H6z"/></svg>mixed signals</span>' + sig;
+    }
+    return '<tr role="button" tabindex="0" data-id="'+r.customer_id+'" data-idx="'+idx+'" title="Open '+esc(r.name)+'" aria-label="Open account '+esc(r.name)+'">'
+      + '<td><div style="font-weight:600">'+esc(r.name)+'</div><div style="font-size:var(--fs-12);color:var(--text-3)">#'+r.customer_id+'</div></td>'
+      + '<td>'+plPill+'</td>'
+      + '<td class="right">'
+      +   '<span class="tabular" style="font-weight:600;color:'+bc+'">'+pct+'%</span>'
+      +   '<div class="mini-bar"><div class="mini-bar-fill" style="width:'+pct+'%;'+(pct>0?'min-width:3px;':'')+'background:'+bc+'"></div></div>'
+      + '</td>'
+      + '<td class="right">'
+      +   '<span class="tabular" style="font-weight:600">'+r.health_score+'<span style="color:var(--text-3);font-weight:400">/100</span></span>'
+      +   '<div class="mini-bar"><div class="mini-bar-fill" style="width:'+r.health_score+'%;background:'+hbc+'"></div></div>'
+      + '</td>'
+      + '<td>'+pPill+'</td>'
+      + '<td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="'+sigTitle+'">'+sig+'</td>'
+      + '<td class="right tabular" style="'+rSty+'">'+rStr+'</td>'
+      + '</tr>';
+  }).join('');
+
+  tbody.innerHTML = html;
+
+  tbody.querySelectorAll('tr[data-id]').forEach(function(tr) {
+    var id  = +tr.dataset.id;
+    var idx = +tr.dataset.idx;
+    tr.addEventListener('click',   function(){ navigate('#/customer/'+id); });
+    tr.addEventListener('keydown', function(e) {
+      if (e.key==='Enter'||e.key===' '){ e.preventDefault(); navigate('#/customer/'+id); }
+      if (e.key==='j'||e.key==='ArrowDown'){ e.preventDefault(); focusRow(idx+1); }
+      if (e.key==='k'||e.key==='ArrowUp'){  e.preventDefault(); focusRow(idx-1); }
+    });
+  });
+}
+
+function focusRow(idx) {
+  var rows = Array.from(document.querySelectorAll('tbody tr[data-id]'));
+  if (!rows.length) return;
+  var t = Math.max(0, Math.min(idx, rows.length-1));
+  rows[t].focus(); S.selectedRow = t;
+}
+
+// â”€â”€ CUSTOMER 360
+async function renderCustomer(id) {
+  S.currentCid = id; S.editedDraft = null; S.analysisId = null;
+  setMain(
+    '<div class="breadcrumb" id="breadcrumb"><a href="#/">&#8592; Accounts</a>'
+    + '<div class="breadcrumb-meta"><div class="shimmer" style="height:28px;width:200px;border-radius:4px"></div></div></div>'
+    + '<div class="c360-grid" id="c360-grid">'
+    + '<div id="c360-left"><div class="card mb4"><div class="card-body">'+skelCard()+'</div></div></div>'
+    + '<div class="c360-right" id="c360-right"><div class="card"><div class="card-body" style="min-height:160px">'
+    + '<div class="shimmer" style="height:14px;width:120px;margin-bottom:12px"></div>'
+    + '<div class="shimmer" style="height:40px;width:160px;border-radius:6px"></div>'
+    + '</div></div></div></div>'
+  );
+  try {
+    var d = await api('/api/customers/'+id);
+    S.currentDetail = d;
+    renderC360(d);
+  } catch(e) {
+    console.error('Customer load failed', e);
+    $id('main').innerHTML = '<a href="#/" style="font-size:var(--fs-13);color:var(--accent-text);text-decoration:none">&#8592; Accounts</a>'
+      + '<div class="alert alert-error" style="margin-top:16px">Could not load account. '
+      + '<button class="btn btn-secondary btn-sm" onclick="renderCustomer('+id+')">Retry</button></div>';
+  }
+}
+
+function skelCard() {
+  var items = '';
+  for (var i=0; i<7; i++) {
+    items += '<div><div class="shimmer" style="height:10px;width:50px;margin-bottom:4px"></div>'
+           + '<div class="shimmer" style="height:14px;width:70px"></div></div>';
+  }
+  return '<div class="shimmer" style="height:12px;width:60px;margin-bottom:16px"></div>'
+       + '<div class="id-grid">'+items+'</div>';
+}
+
+function renderC360(d) {
+  var c  = d.customer, sig = d.signals, us = d.usage_series || [], fl = d.feedback_list || [];
+  var la = d.last_analysis;
+  var band = la && la.risk_breakdown ? la.risk_breakdown.risk_band : 'healthy';
+
+  $id('breadcrumb').innerHTML =
+    '<a href="#/">&#8592; Accounts</a>'
+    + '<div class="breadcrumb-meta">'
+    + '<span class="breadcrumb-title">'+esc(c.name||'Account')+'</span>'
+    + '<span style="font-size:var(--fs-14);color:var(--text-3)">#'+c.customer_id+'</span>'
+    + '<span class="pill '+planPillCls(c.plan_tier)+'">'+esc(c.plan_tier||DASH)+'</span>'
+    + '<span class="pill '+bandPillCls(la && la.ml ? la.ml.band : 'unknown')+'">ML '+(la && la.ml ? Math.round(la.ml.churn_probability*100)+'%' : 'N/A')+'</span>'
+    + '<span class="pill '+bandPillCls(band)+'">Health '+(la && la.risk_breakdown ? la.risk_breakdown.health_score : 'N/A')+'</span>'
+    + '</div>';
+
+  $id('c360-left').innerHTML =
+    buildIdentity(c, sig) + buildDualScore(la, sig) + buildContribs(la) + buildUsage(sig, us) + buildFeedback(fl);
+
+  $id('c360-right').innerHTML = buildAnalysisCard(la, c.customer_id);
+  wireC360(c.customer_id, la);
+}
+
+// Identity card
+function buildIdentity(c, sig) {
+  var items = [
+    ['Plan',            esc(c.plan_tier||DASH)],
+    ['ARR',             c.arr ? '<span class="tabular">'+fmtMoney(c.arr)+'</span>' : DASH],
+    ['Tenure',          '<span class="tabular">'+tenureLabel(c.tenure_days)+'</span>'],
+    ['Renewal',         '<span class="tabular" style="'+relDaysStyle(c.days_to_renewal)+'">'+relDays(c.days_to_renewal)+'</span>'],
+    ['Devices',         '<span class="tabular">'+(c.num_devices!=null?c.num_devices:DASH)+'</span>'],
+    ['Last login',      '<span class="tabular">'+lastLoginLabel(sig.last_login_days)+'</span>'],
+    ['Monthly charges', c.monthly_charges ? '<span class="tabular">'+fmtMoney(c.monthly_charges)+'</span>' : DASH],
+  ];
+  var grid = items.map(function(it){
+    return '<div class="id-item"><div class="id-label">'+it[0]+'</div><div class="id-value">'+it[1]+'</div></div>';
+  }).join('');
+  return '<div class="card mb4"><div class="card-header"><span class="card-title">Identity</span></div>'
+       + '<div class="card-body"><div class="id-grid">'+grid+'</div></div></div>';
+}
+
+// Dual score panel
+function buildDualScore(la, sig) {
+  if (!la) {
+    return '<div class="card mb4"><div class="card-header"><span class="card-title">Risk scores &mdash; two methods</span></div>'
+         + '<div class="dual-score">'
+         + '<div class="score-col"><div class="score-label">Churn probability &mdash; ML</div><span style="color:var(--text-3);font-size:var(--fs-13)">Run analysis to see</span></div>'
+         + '<div class="score-col"><div class="score-label">Health score &mdash; rule-based</div><span style="color:var(--text-3);font-size:var(--fs-13)">Run analysis to see</span></div>'
+         + '</div></div>';
+  }
+  var ml = la.ml, rb = la.risk_breakdown;
+  var churnPct = Math.round(ml.churn_probability * 100);
+  var mlC = bandColor(ml.band), hC = bandColor(rb.risk_band);
+  var ver = (ml.model_version || 'unknown').slice(0, 16);
+
+  var feats = ml.top_features || [];
+  var maxFI = feats.reduce(function(m,f){ return Math.max(m, Math.abs(f.importance||f.contribution||0)); }, 1);
+  var featRows = feats.slice(0,6).map(function(f) {
+    var imp = f.importance != null ? f.importance : (f.contribution || 0);
+    var w   = Math.round(Math.abs(imp) / maxFI * 100);
+    var col = imp > 0 ? 'var(--crit)' : 'var(--ok)';
+    return '<div class="ml-feat-row">'
+      + '<span class="ml-feat-name">'+esc(f.feature||f.name||'')+'</span>'
+      + '<span class="ml-feat-val">'+(f.value!=null?esc(String(f.value)):'')+'</span>'
+      + '<div class="ml-feat-bar-wrap"><div class="ml-feat-bar-fill" style="width:'+w+'%;background:'+col+'"></div></div>'
+      + '</div>';
+  }).join('') || '<div style="font-size:var(--fs-12);color:var(--text-3)">No feature data.</div>';
+
+  var rbRows = buildContribRows(rb.contributors||[], rb.positives||[], true);
+
+  var ma = la.method_agreement || {};
+  var agreeStrip;
+  if (ma.agree) {
+    agreeStrip = '<div class="method-agree-strip" style="background:var(--ok-bg);border-top:1px solid #abefc6">'
+      + '<svg width="14" height="14" viewBox="0 0 14 14" fill="var(--ok)" aria-hidden="true"><path d="M7 0C3.134 0 0 3.134 0 7s3.134 7 7 7 7-3.134 7-7S10.866 0 7 0zm-1.5 10.5L2 7l1.4-1.4 2.1 2.1 4.1-4.1L11 5l-5.5 5.5z"/></svg>'
+      + 'Both methods agree: account is <strong>'+bandLabel(rb.risk_band)+'</strong>.</div>';
+  } else {
+    agreeStrip = '<div class="method-agree-strip" style="background:var(--high-bg);border-top:1px solid #fedf89">'
+      + '<svg width="14" height="14" viewBox="0 0 14 14" fill="var(--high)" aria-hidden="true"><path d="M7 0L0 12h14L7 0zm0 10.5c-.55 0-1-.45-1-1s.45-1 1-1 1 .45 1 1-.45 1-1 1zm-1-3V4.5h2v3H6z"/></svg>'
+      + 'ML and rule-based risk differ'+(ma.gap ? ' by '+ma.gap : '')+'. Review signals below.</div>';
+  }
+
+  return '<div class="card mb4"><div class="card-header"><span class="card-title">Risk scores &mdash; two methods</span></div>'
+    + '<div class="dual-score">'
+    + '<div class="score-col">'
+    +   '<div class="score-label">Churn probability &mdash; ML model</div>'
+    +   '<div class="score-big tabular" style="color:'+mlC+'">'+churnPct+'%</div>'
+    +   '<div class="score-caption">XGBoost &middot; '+esc(ver)+'</div>'
+    +   '<div class="score-bar8"><div class="score-bar8-fill" style="width:'+churnPct+'%;background:'+mlC+'"></div></div>'
+    +   '<button class="how-toggle" id="ml-how-btn" aria-expanded="false">How? &#9660;</button>'
+    +   '<div class="how-panel" id="ml-how-panel" aria-hidden="true">'
+    +     '<div style="font-size:var(--fs-12);color:var(--text-3);margin:8px 0 4px">Top feature contributions:</div>'+featRows
+    +   '</div>'
+    + '</div>'
+    + '<div class="score-col">'
+    +   '<div class="score-label">Health score &mdash; rule-based</div>'
+    +   '<div class="score-big tabular" style="color:'+hC+'">'+rb.health_score+'<span style="font-size:var(--fs-14);font-weight:400;color:var(--text-3)">/100</span></div>'
+    +   '<div class="score-caption">'+bandLabel(rb.risk_band)+'</div>'
+    +   '<div class="score-bar8"><div class="score-bar8-fill" style="width:'+rb.health_score+'%;background:'+hC+'"></div></div>'
+    +   '<button class="how-toggle" id="rb-how-btn" aria-expanded="false">How? &#9660;</button>'
+    +   '<div class="how-panel" id="rb-how-panel" aria-hidden="true">'
+    +     '<div style="font-size:var(--fs-12);color:var(--text-3);margin:8px 0 4px">Health score contributors:</div>'+rbRows
+    +   '</div>'
+    + '</div>'
+    + '</div>'
+    + agreeStrip
+    + '</div>';
+}
+
+function buildContribRows(contribs, positives, mini) {
+  var all = contribs.concat(positives||[]);
+  if (!all.length) return '<div style="font-size:var(--fs-12);color:var(--text-3)">No contributor data.</div>';
+  var maxA = all.reduce(function(m,c){ return Math.max(m, Math.abs(c.impact)); }, 1);
+  return all.slice(0,8).map(function(c) {
+    var pos  = c.impact >= 0;
+    var w    = Math.round(Math.abs(c.impact) / maxA * 50);
+    var col  = pos ? 'var(--ok)' : 'var(--crit)';
+    var side = pos ? 'left:50%' : 'right:50%';
+    var sign = pos ? '+' : '';
+    return '<div title="'+esc(c.detail||c.label)+'" style="margin-bottom:'+(mini?'6':'10')+'px">'
+      + '<div style="display:flex;align-items:baseline;justify-content:space-between;margin-bottom:2px;gap:8px">'
+      +   '<span style="font-size:var(--fs-13);color:var(--text);flex:1;min-width:0">'+esc(c.label)+'</span>'
+      +   '<span style="font-size:var(--fs-12);color:var(--text-3);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:120px">'+esc(c.detail||'')+'</span>'
+      +   '<span style="font-size:var(--fs-13);font-weight:600;font-variant-numeric:tabular-nums;color:'+col+';min-width:40px;text-align:right">'+sign+c.impact.toFixed(1)+'</span>'
+      + '</div>'
+      + '<div class="div-bar-wrap"><div class="div-bar-center"></div>'
+      +   '<div class="div-bar-fill" style="width:'+w+'%;'+side+';background:'+col+'"></div>'
+      + '</div></div>';
+  }).join('');
+}
+
+function buildContribs(la) {
+  if (!la) return '';
+  return '<div class="card mb4"><div class="card-header"><span class="card-title">Why &mdash; health score drivers</span></div>'
+       + '<div class="card-body">'+buildContribRows(la.risk_breakdown.contributors||[],la.risk_breakdown.positives||[])+'</div></div>';
+}
+
+// Usage sparkline
+function buildUsage(sig, series) {
+  var trend = sig.usage_trend_pct;
+  var tStr = DASH, tSty = '';
+  if (trend != null) {
+    if (trend <= -0.99) {
+      tStr = 'no usage in last 7 days';
+      tSty = 'color:var(--crit)';
+    } else {
+      var p = Math.round(trend * 100);
+      tStr = (p >= 0 ? '&#9650; ' : '&#9660; ') + Math.abs(p) + '%';
+      tSty = p <= -20 ? 'color:var(--crit)' : p < 0 ? 'color:var(--high)' : 'color:var(--ok)';
+    }
+  }
+  var pts = (series || []).map(function(u){ return u.active_minutes || 0; });
+  return '<div class="card mb4">'
+    + '<div class="card-header"><span class="card-title">Usage &mdash; last 30 days</span>'
+    +   '<span class="tabular" style="font-size:var(--fs-14);font-weight:600;'+tSty+'">'+tStr+'</span>'
+    + '</div>'
+    + '<div class="card-body">'+sparkline(pts)
+    +   '<div style="font-size:var(--fs-12);color:var(--text-3);margin-top:8px">'
+    +   'Logins (30d): <strong>'+(sig.logins_last_30!=null?sig.logins_last_30:DASH)+'</strong>'
+    +   ' &middot; Active days: <strong>'+(sig.active_days_last_30!=null?sig.active_days_last_30:DASH)+'</strong>'
+    +   '</div></div></div>';
+}
+
+// Feedback
+function buildFeedback(list) {
+  var n = list.length;
+  var body;
+  if (!n) {
+    body = '<div style="font-size:var(--fs-13);color:var(--text-3)">No feedback on record.</div>';
+  } else {
+    body = list.map(function(fb) {
+      var s   = fb.sentiment != null ? fb.sentiment : 0;
+      var sC  = s < -0.1 ? 'var(--crit)' : s > 0.1 ? 'var(--ok)' : 'var(--neutral)';
+      var sBg = s < -0.1 ? 'var(--crit-bg)' : s > 0.1 ? 'var(--ok-bg)' : 'var(--neutral-bg)';
+      var sL  = (s >= 0 ? '+' : '') + s.toFixed(2);
+      var d   = (fb.date||fb.created_at||'').slice(0,10);
+      var comp = fb.is_complaint ? '<span class="pill pill-crit" style="font-size:11px">Complaint</span>' : '';
+      return '<div class="fb-item">'
+        + '<div class="fb-row">'
+        +   '<span class="pill pill-neutral">'+esc(fb.channel||'unknown')+'</span>'
+        +   '<span style="font-size:var(--fs-12);color:var(--text-3)">'+d+'</span>'
+        +   '<span class="pill" style="background:'+sBg+';color:'+sC+'">'+sL+'</span>'
+        +   comp
+        + '</div>'
+        + '<div class="fb-text">'+esc(fb.text||fb.feedback_text||'')+'</div>'
+        + '</div>';
+    }).join('');
+  }
+  return '<div class="card mb4"><div class="card-header"><span class="card-title">Recent feedback ('+n+')</span></div>'
+       + '<div class="card-body">'+body+'</div></div>';
+}
+
+// Analysis card
+function buildAnalysisCard(la, cid) {
+  if (!la) {
+    return '<div class="card" id="analysis-card">'
+      + '<div class="card-header"><span class="card-title">Recommendation</span></div>'
+      + '<div class="analyze-empty">'
+      + '<p class="analyze-desc">Run the agent to get a grounded retention recommendation for this account.</p>'
+      + '<button class="btn btn-primary btn-lg" id="analyze-btn" data-cid="'+cid+'">Analyze account</button>'
+      + '<p class="analyze-caption">Runs ML scoring, retrieves the matching playbook, and drafts outreach. ~3-6s.</p>'
+      + '<div id="analyze-ticker" class="ticker"></div>'
+      + '</div></div>';
+  }
+
+  S.analysisId = la.analysis_id;
+  var prio    = la.priority || 'P2';
+  var genBy   = genByLabel(la.generated_by);
+  var draft   = S.editedDraft != null ? S.editedDraft : (la.draft_message || '');
+  var curStat = la.status || 'new';
+  var pb      = la.playbook || {};
+
+  // Summary with inline playbook chip
+  var sumHtml = esc(la.summary || '');
+  if (pb.title) {
+    sumHtml = sumHtml.replace(/(per playbook|Per playbook)/gi, function(m) {
+      return m + ' <button class="playbook-chip" onclick="var el=document.getElementById(\'playbook-box\');if(el)el.scrollIntoView({behavior:\'smooth\'})">'+esc(pb.title)+'</button>';
+    });
+  }
+
+  var reasons = (la.top_reasons || []).slice(0,3).map(function(r){ return '<li>'+esc(r)+'</li>'; }).join('');
+  var escalate = la.escalate
+    ? '<div class="escalate-strip"><svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 1L1 14h14L8 1zm0 11a1 1 0 110 2 1 1 0 010-2zm-1-7h2v5H7V5z"/></svg>P0 &mdash; escalate now</div>'
+    : '';
+  var p0Dot = prio === 'P0' ? '<span class="p0-dot"></span>' : '';
+  var statusLine = curStat !== 'new' ? 'Status: '+curStat+' \u00b7 saved' : '';
+
+  return '<div class="card" id="analysis-card">'
+    + escalate
+    + '<div class="card-header">'
+    +   '<span class="card-title">Recommendation</span>'
+    +   '<div style="display:flex;align-items:center;gap:8px">'
+    +     '<span class="pill '+prioPillCls(prio)+'">'+p0Dot+prio+'</span>'
+    +     '<button class="rerun-link" id="rerun-btn" data-cid="'+cid+'">Re-run</button>'
+    +   '</div>'
+    + '</div>'
+    + '<div class="card-body">'
+    +   '<div class="genby" style="margin-bottom:12px">Generated by: '+esc(genBy)+'</div>'
+    +   '<div class="summary-text">'+sumHtml+'</div>'
+    +   (reasons ? '<ul class="reasons-list">'+reasons+'</ul>' : '')
+    +   '<div class="action-section">'
+    +     '<div class="action-label">Recommended action</div>'
+    +     '<div class="action-text">'+esc(la.recommended_action||DASH)+'</div>'
+    +   '</div>'
+    +   (draft ? '<div class="draft-wrap">'
+    +     '<div class="draft-label-row">'
+    +       '<label for="draft-ta" class="draft-label">Draft outreach</label>'
+    +       '<span class="char-count" id="char-count">'+draft.length+' chars</span>'
+    +     '</div>'
+    +     '<textarea id="draft-ta" class="draft" rows="8" aria-label="Draft outreach message">'+esc(draft)+'</textarea>'
+    +   '</div>' : '')
+    +   '<div class="success-panel hidden" id="success-panel" style="background:var(--ok-bg);color:var(--ok);padding:var(--s-4);border-radius:var(--radius-sm);margin-top:var(--s-4);display:flex;align-items:center;gap:12px;border:1px solid #c3e6cb">'
+    +     '<svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>'
+    +     '<div style="font-weight:600">Action scheduled</div>'
+    +   '</div>'
+    +   '<div id="analyze-ticker" class="ticker"></div>'
+    + '</div>'
+    + '<div class="approve-bar" id="approve-bar">'
+    +   '<button class="btn btn-ok btn-sm" id="approve-btn"'+(curStat==='approved'?' disabled':'')+'>'
+    +     '<span class="approve-text" style="display:inline-block;transition:all 0.3s">Approve & Send</span>'
+    +     '<svg class="approve-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="position:absolute;top:50%;left:50%;margin-top:-8px;margin-left:-8px;opacity:0;transform:translate(-20px,20px);transition:all 0.5s cubic-bezier(0.175, 0.885, 0.32, 1.275)"><path d="M22 2L11 13M22 2l-7 20-4-9-9-4 20-7z"/></svg>'
+    +   '</button>'
+    +   '<button class="btn btn-secondary btn-sm" id="save-edit-btn" disabled>Save edit</button>'
+    +   '<div id="dismiss-area"><button class="btn btn-ghost btn-sm" id="dismiss-btn">Dismiss</button></div>'
+    +   '<span class="approve-status" id="approve-status">'+statusLine+'</span>'
+    + '</div>'
+    + '</div>'
+    + (pb.title ? buildPlaybook(pb) : '');
+}
+
+function buildPlaybook(pb) {
+  var method = pb.method === 'embedding'
+    ? 'semantic match ' + (pb.score != null ? pb.score.toFixed(2) : '')
+    : 'keyword match';
+  var lc = pb.low_confidence ? '<span class="pill pill-high" style="font-size:11px">low confidence</span>' : '';
+  return '<div class="card" style="margin-top:var(--s-4)" id="playbook-box">'
+    + '<div class="card-header">'
+    +   '<span class="card-title">Retrieved playbook</span>'
+    +   '<div style="display:flex;align-items:center;gap:8px"><span class="pill pill-neutral" style="font-size:11px">'+esc(method)+'</span>'+lc+'</div>'
+    + '</div>'
+    + '<div class="card-body">'
+    +   '<div style="font-weight:600;margin-bottom:8px">'+esc(pb.title)+'</div>'
+    +   '<div class="playbook-text">'+esc(pb.text||'')+'</div>'
+    +   '<div style="font-size:var(--fs-12);color:var(--text-3);margin-top:8px">Selected by cosine similarity over the retention playbook corpus.</div>'
+    + '</div></div>';
+}
+
+// Wire C360 interactions
+function wireC360(cid, la) {
+  function toggler(btnId, panelId, upLabel, downLabel) {
+    var btn = $id(btnId), pan = $id(panelId);
+    if (!btn || !pan) return;
+    btn.addEventListener('click', function() {
+      var open = pan.classList.toggle('open');
+      btn.innerHTML = open ? (upLabel || 'How? &#9650;') : (downLabel || 'How? &#9660;');
+      btn.setAttribute('aria-expanded', String(open));
+      pan.setAttribute('aria-hidden', String(!open));
+    });
+  }
+  toggler('ml-how-btn', 'ml-how-panel');
+  toggler('rb-how-btn', 'rb-how-panel');
+
+  var analyzeBtn = $id('analyze-btn');
+  if (analyzeBtn) analyzeBtn.addEventListener('click', function(){ runAnalyze(cid); });
+
+  var rerunBtn = $id('rerun-btn');
+  if (rerunBtn) rerunBtn.addEventListener('click', function() {
+    if (la && la.status && la.status !== 'new') {
+      if (!confirm('Re-running replaces the current analysis. Continue?')) return;
+    }
+    runAnalyze(cid);
+  });
+
+  var draftTa  = $id('draft-ta');
+  var saveBtn  = $id('save-edit-btn');
+  var ccEl     = $id('char-count');
+  if (draftTa && saveBtn) {
+    var orig = la && la.draft_message ? la.draft_message : '';
+    draftTa.addEventListener('input', function() {
+      S.editedDraft = draftTa.value;
+      saveBtn.disabled = (draftTa.value === orig);
+      if (ccEl) ccEl.textContent = draftTa.value.length + ' chars';
+    });
+  }
+
+  var approveBtn = $id('approve-btn');
+  if (approveBtn) approveBtn.addEventListener('click', function(){ sendApproval(cid, 'approved'); });
+  if (saveBtn)    saveBtn.addEventListener('click',    function(){ sendApproval(cid, 'edited'); });
+
+  var dismissArea = $id('dismiss-area');
+  var dismissBtn  = $id('dismiss-btn');
+  if (dismissBtn && dismissArea) {
+    dismissBtn.addEventListener('click', function() {
+      dismissArea.innerHTML = '<span class="dismiss-confirm">Dismiss this recommendation? '
+        + '<button class="btn btn-ghost btn-sm" id="dyes">Yes</button>'
+        + '<button class="btn btn-ghost btn-sm" id="dno">No</button>'
+        + '</span>';
+      $id('dyes').addEventListener('click', function(){ sendApproval(cid, 'dismissed'); });
+      $id('dno').addEventListener('click', function() {
+        dismissArea.innerHTML = '<button class="btn btn-ghost btn-sm" id="dismiss-btn">Dismiss</button>';
+        wireC360(cid, la);
+      });
+    });
+  }
+}
+
+async function sendApproval(cid, status) {
+  var ta   = $id('draft-ta');
+  var body = { status: status, message: ta ? ta.value : '' };
+  if (S.analysisId) body.analysis_id = S.analysisId;
+
+  var ab = $id('approve-btn');
+  if (status === 'approved' && ab) {
+    ab.classList.add('sending');
+    await new Promise(function(resolve) { setTimeout(resolve, 600); });
+  }
+
+  try {
+    await api('/api/customers/'+cid+'/approve', { method:'POST', body:JSON.stringify(body) });
+    
+    if (S.dashboard) {
+      var r = S.dashboard.find(function(row) { return String(row.customer_id) === String(cid); });
+      if (r) r.approval_status = status;
+    }
+
+    if (status === 'approved') {
+      $id('analysis-card').classList.add('success-border');
+      var dw = document.querySelector('.draft-wrap'); if(dw) dw.classList.add('hidden');
+      var sp = $id('success-panel'); if(sp) sp.classList.remove('hidden');
+      var aBar = $id('approve-bar'); if(aBar) aBar.classList.add('hidden');
+      toast('Saved', 'ok');
+    } else {
+      toast('Saved', 'ok');
+      var se = $id('approve-status'); if (se) se.textContent = 'Status: '+status+' \u00b7 just now';
+      if (status==='dismissed') {
+        if(ab) ab.disabled=true;
+        var sb=$id('save-edit-btn'); if(sb) sb.disabled=true;
+        if($id('dismiss-area')) $id('dismiss-area').innerHTML = '<span style="font-size:var(--fs-13);color:var(--text-3)">Dismissed</span>';
+        var dw = document.querySelector('.draft-wrap'); if(dw) dw.classList.add('hidden');
+      } else if (status==='edited') {
+        var sb=$id('save-edit-btn'); if(sb) sb.disabled=true;
+      }
+    }
+  } catch(e) {
+    if (status === 'approved' && ab) ab.classList.remove('sending');
+    toast('Error: ' + e.message, 'err');
+  }
+}
+
+// Analyze flow
+async function runAnalyze(cid) {
+  var btn = $id('analyze-btn');
+  if (btn) { btn.disabled = true; btn.textContent = 'Analyzing...'; }
+  showTicker();
+  var step = 0;
+  advanceTicker(step);
+  var iv = setInterval(function(){ step = Math.min(step+1, 2); advanceTicker(step); }, 1200);
+  try {
+    var la = await api('/api/customers/'+cid+'/analyze', { method:'POST', body:'{}' });
+    clearInterval(iv);
+    S.editedDraft = null; S.analysisId = la.analysis_id;
+    var right = $id('c360-right');
+    if (right) right.innerHTML = buildAnalysisCard(la, cid);
+    if (S.currentDetail) {
+      S.currentDetail.last_analysis = la;
+      var left = $id('c360-left');
+      if (left) left.innerHTML =
+        buildIdentity(S.currentDetail.customer, S.currentDetail.signals) +
+        buildDualScore(la, S.currentDetail.signals) +
+        buildContribs(la) +
+        buildUsage(S.currentDetail.signals, S.currentDetail.usage_series||[]) +
+        buildFeedback(S.currentDetail.feedback_list||[]);
+    }
+    wireC360(cid, la);
+  } catch(e) {
+    clearInterval(iv);
+    console.error('Analyze failed', e);
+    var t = $id('analyze-ticker');
+    if (t) t.innerHTML = '<div class="alert alert-error" style="margin-top:8px">Analysis failed. '
+      + '<button class="btn btn-secondary btn-sm" onclick="runAnalyze('+cid+')">Retry</button></div>';
+    if (btn) { btn.disabled = false; btn.textContent = 'Analyze account'; }
+  }
+}
+
+function showTicker() {
+  var steps = ['Scoring signals','Retrieving playbook','Drafting outreach'];
+  var t = $id('analyze-ticker');
+  if (!t) return;
+  t.innerHTML = steps.map(function(s,i) {
+    return '<div class="ticker-step" id="tick-'+i+'">'
+      + '<svg class="tick-icon" viewBox="0 0 16 16" fill="none" aria-hidden="true">'
+      + '<circle cx="8" cy="8" r="7" stroke="currentColor" stroke-width="1.5" opacity="0.4"/></svg>'
+      + s+'</div>';
+  }).join('');
+}
+
+function advanceTicker(active) {
+  var pm = window.matchMedia('(prefers-reduced-motion:reduce)').matches;
+  [0,1,2].forEach(function(i) {
+    var e = $id('tick-'+i); if (!e) return;
+    e.classList.remove('active','done');
+    var svg = e.querySelector('svg');
+    if (i < active) {
+      e.classList.add('done');
+      if (svg) svg.innerHTML = '<path d="M4 8l3 3 5-5" stroke="var(--ok)" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/><circle cx="8" cy="8" r="7" stroke="var(--ok)" stroke-width="1.5" fill="none"/>';
+    } else if (i === active) {
+      e.classList.add('active');
+      if (svg && !pm) svg.innerHTML = '<circle cx="8" cy="8" r="7" stroke="currentColor" stroke-width="1.5" fill="none" stroke-dasharray="44" stroke-dashoffset="44"><animate attributeName="stroke-dashoffset" from="44" to="0" dur="1.2s" repeatCount="indefinite"/></circle>';
+    }
+  });
+}
+
+// Router
+function navigate(hash) { location.hash = hash; }
+function route() {
+  var h = location.hash || '#/';
+  if (h.indexOf('#/customer/') === 0) {
+    var id = parseInt(h.split('/')[2], 10);
+    if (!isNaN(id)) renderCustomer(id); else renderDashboard();
+  } else renderDashboard();
+}
+
+// Health check
+async function checkHealth() {
+  try {
+    var h = await api('/api/health');
+    var ok = h.status === 'ok';
+    var ind = $id('health-indicator'); if (ind) ind.className = ok ? 'dot' : 'dot degraded';
+    var lbl = $id('health-label');     if (lbl) lbl.textContent = ok ? 'System healthy' : 'System degraded';
+  } catch(e) {
+    var ind2 = $id('health-indicator'); if (ind2) ind2.className = 'dot degraded';
+  }
+}
+async function showHealthModal() {
+  var pop = $id('health-popover');
+  var btn = $id('health-btn');
+  var open = pop.classList.toggle('hidden');
+  btn.setAttribute('aria-expanded', String(!open));
+  if (!open) {
+    var body = $id('health-popover-body'); body.textContent = 'Loading...';
+    try {
+      var h = await api('/api/health');
+      var rows = '<div class="health-kv"><span>Status</span><span><strong>'+h.status+'</strong></span></div>';
+      Object.keys(h.components || {}).forEach(function(k) {
+        rows += '<div class="health-kv"><span>'+k+'</span><span>'+JSON.stringify(h.components[k]).slice(0,120)+'</span></div>';
+      });
+      body.innerHTML = rows;
+    } catch(e) { body.textContent = 'Could not fetch health data.'; }
+  }
+}
+
+// How It Works Modal
+function openHowModal(tab) {
+  var hm = $id('how-modal');
+  if (!hm) return;
+  hm.classList.remove('hidden');
+  var cb = $id('how-dont-show');
+  if (cb) cb.checked = localStorage.getItem('cra_onboarded') === '1';
+  switchHowTab(typeof tab === 'string' ? tab : 'pipeline');
+  
+  setTimeout(function() {
+    document.querySelectorAll('.stage-card').forEach(function(c, i) {
+      setTimeout(function(){ c.classList.add('in'); }, i * 150);
+    });
+    var prog = $id('pipe-prog');
+    if (prog) {
+      prog.classList.remove('in');
+      setTimeout(function(){ prog.classList.add('in'); }, 50);
+    }
+  }, 100);
+}
+
+function switchHowTab(tabId) {
+  document.querySelectorAll('.how-tab').forEach(function(b) {
+    b.classList.toggle('active', b.getAttribute('data-tab') === tabId);
+  });
+  document.querySelectorAll('.how-tab-pane').forEach(function(p) {
+    p.classList.toggle('active', p.id === 'tab-' + tabId);
+  });
+}
+
+document.querySelectorAll('.how-tab').forEach(function(b) {
+  b.addEventListener('click', function() { switchHowTab(this.getAttribute('data-tab')); });
+});
+
+function closeHowModal() {
+  var hm = $id('how-modal');
+  if (hm) hm.classList.add('hidden');
+  document.querySelectorAll('.stage-card').forEach(function(c){ c.classList.remove('in'); });
+  var prog = $id('pipe-prog'); if (prog) prog.classList.remove('in');
+}
+
+$id('how-close').addEventListener('click', closeHowModal);
+$id('how-close-x').addEventListener('click', closeHowModal);
+$id('how-modal').addEventListener('click', function(e) { if(e.target===this) closeHowModal(); });
+
+var hdCb = $id('how-dont-show');
+if (hdCb) {
+  hdCb.addEventListener('change', function() {
+    if (this.checked) localStorage.setItem('cra_onboarded', '1');
+    else localStorage.removeItem('cra_onboarded');
+  });
+}
+
+// Keyboard shortcuts
+document.addEventListener('keydown', function(e) {
+  var inInput = ['INPUT','TEXTAREA','SELECT'].indexOf(e.target.tagName) >= 0;
+  var h = location.hash || '#/';
+  var isDash = h.indexOf('#/customer/') !== 0;
+
+  if (e.key === '?') { e.preventDefault(); openHowModal('shortcuts'); return; }
+  if (e.key === 'Escape') {
+    var hm = $id('how-modal'); if (hm) closeHowModal();
+    $id('health-popover').classList.add('hidden');
+    $id('health-btn').setAttribute('aria-expanded','false');
+    $id('demo-dropdown').classList.add('hidden');
+    $id('demo-toggle').setAttribute('aria-expanded','false');
+    if (!isDash && !inInput) { e.preventDefault(); navigate('#/'); }
+    return;
+  }
+  if (inInput) return;
+  if (isDash) {
+    if (e.key === '/') { e.preventDefault(); var s=$id('sort-sel'); if(s) s.focus(); }
+    if (e.key==='j'||e.key==='ArrowDown') { e.preventDefault(); focusRow(S.selectedRow+1); }
+    if (e.key==='k'||e.key==='ArrowUp')   { e.preventDefault(); focusRow(S.selectedRow-1); }
+    if (e.key==='Enter') { var f=document.querySelector('tbody tr:focus'); if(f) f.click(); }
+  } else {
+    if (e.key === 'a') { e.preventDefault(); var b=$id('analyze-btn'); if(b&&!b.disabled) b.click(); }
+  }
+});
+
+// Topbar wiring
+$id('health-btn').addEventListener('click', showHealthModal);
+$id('how-btn').addEventListener('click', openHowModal);
+
+var dtBtn = $id('demo-toggle'), dtDd = $id('demo-dropdown');
+if (dtBtn) {
+  dtBtn.addEventListener('click', function() {
+    var open = dtDd.classList.toggle('hidden');
+    dtBtn.setAttribute('aria-expanded', String(!open));
+  });
+}
+
+document.addEventListener('click', function(e) {
+  if (!dtBtn.contains(e.target) && !dtDd.contains(e.target)) {
+    dtDd.classList.add('hidden'); dtBtn.setAttribute('aria-expanded','false');
+  }
+  var hb = $id('health-btn'), hp = $id('health-popover');
+  if (hb && hp && !hb.contains(e.target) && !hp.contains(e.target)) {
+    hp.classList.add('hidden'); hb.setAttribute('aria-expanded','false');
+  }
+});
+
+// Boot
+function renderLogin(errorMsg) {
+  $id('signout-btn').style.display = 'none';
+  var errHtml = errorMsg ? '<div class="alert alert-error" style="margin-bottom:16px">' + esc(errorMsg) + '</div>' : '';
+  setMain(
+    '<div style="max-width:360px;margin:80px auto" class="card">'
+    + '<div class="card-header"><span class="card-title">Sign in to Churn Risk Agent</span></div>'
+    + '<div class="card-body">'
+    + errHtml
+    + '<form id="login-form">'
+    + '<div style="margin-bottom:16px"><label style="display:block;font-size:var(--fs-13);font-weight:500;margin-bottom:4px">Username</label><input type="text" id="login-user" required style="width:100%;padding:8px;border:1px solid var(--border);border-radius:var(--radius-sm);font-family:var(--font)"/></div>'
+    + '<div style="margin-bottom:24px"><label style="display:block;font-size:var(--fs-13);font-weight:500;margin-bottom:4px">Password</label><input type="password" id="login-pass" required style="width:100%;padding:8px;border:1px solid var(--border);border-radius:var(--radius-sm);font-family:var(--font)"/></div>'
+    + '<button type="submit" class="btn btn-primary" style="width:100%">Sign in</button>'
+    + '</form>'
+    + '</div></div>'
+  );
+  
+  $id('login-form').addEventListener('submit', async function(e) {
+    e.preventDefault();
+    var btn = e.target.querySelector('button[type="submit"]');
+    if (btn) {
+      btn.classList.add('active-sim');
+      setTimeout(function(){ btn.classList.remove('active-sim'); }, 150);
+    }
+    var u = $id('login-user').value, p = $id('login-pass').value;
+    try {
+      await api('/api/login', { method: 'POST', body: JSON.stringify({username: u, password: p}) });
+      startApp();
+    } catch(err) {
+      renderLogin('Invalid username or password');
+    }
+  });
+}
+
+// --- ROADMAP SVG PRIMITIVES & LOGIC ---
+function rNode(x, y, w, h, title, sub, variant) {
+  var fill = '#fff', stroke = '#d0d5dd', dash = '';
+  if (variant === 'accent') { fill = '#eff4ff'; stroke = '#2563eb'; }
+  else if (variant === 'io') { dash = 'stroke-dasharray="4"'; }
+  else if (variant === 'diamond') { stroke = '#dc6803'; fill = '#fff'; }
+  var r = '<g class="rm-node" transform="translate('+x+','+y+')">';
+  if (variant === 'diamond') {
+    r += '<polygon points="'+(w/2)+',0 '+w+','+(h/2)+' '+(w/2)+','+h+' 0,'+(h/2)+'" fill="'+fill+'" stroke="'+stroke+'" />';
+  } else {
+    r += '<rect width="'+w+'" height="'+h+'" rx="8" fill="'+fill+'" stroke="'+stroke+'" '+dash+' />';
+  }
+  r += '<text x="'+(w/2)+'" y="'+(h/2 - (sub?4:-4))+'" text-anchor="middle" fill="#101828" font-size="12" font-weight="600" font-family="var(--font)">'+title+'</text>';
+  if (sub) r += '<text x="'+(w/2)+'" y="'+(h/2 + 10)+'" text-anchor="middle" fill="#475467" font-size="11" font-family="var(--font)">'+sub+'</text>';
+  r += '</g>';
+  return r;
+}
+function rConn(d, showDot) {
+  var r = '<path d="'+d+'" fill="none" stroke="#d0d5dd" stroke-width="1.5" marker-end="url(#arw)" />';
+  if (showDot) {
+    r += `<circle class="flow-dot" r="2.5" fill="#2563eb" style="offset-path:path('${d}')" />`;
+    r += `<circle class="flow-dot" r="2.5" fill="#2563eb" style="offset-path:path('${d}');animation-delay:0.9s" />`;
+  }
+  return r;
+}
+function rDefs() {
+  return '<defs><marker id="arw" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#475467"/></marker></defs>';
+}
+
+function renderRoadmapTab(tab) {
+  var rc = $id('roadmap-content');
+  var html = '', svg = '', cap = '';
+  
+  if (tab === 'architecture') {
+    svg = '<svg width="860" height="420" viewBox="0 0 860 420">' + rDefs() +
+      '<rect class="rm-box" x="480" y="150" width="360" height="150" rx="12" />' +
+      rConn('M180,60 L180,100', true) +
+      rConn('M180,150 L180,180', true) +
+      rConn('M180,165 L360,165 L360,180', true) +
+      rConn('M180,165 L660,165 L660,180', true) +
+      rConn('M660,230 L660,250 L560,250 L560,270', true) +
+      rConn('M660,250 L760,250 L760,270', true) +
+      rConn('M560,320 L560,360 L180,360 L180,320', true) +
+      rNode(80, 10, 200, 50, 'React SPA', '', '') +
+      rNode(30, 100, 300, 50, 'FastAPI', 'application APIs · business rules · auth · persistence', '') +
+      rNode(80, 180, 200, 50, 'PostgreSQL + pgvector', 'source of truth', '') +
+      rNode(300, 180, 120, 50, 'XGBoost model', 'churn P + SHAP', '') +
+      rNode(510, 180, 300, 50, 'n8n orchestration', 'scheduling · triggers · AI workflow · integrations', 'accent') +
+      rNode(500, 270, 120, 50, 'LLM', 'reasoning & personalize', '') +
+      rNode(630, 270, 120, 50, 'RAG playbook', 'retrieval', '') +
+      rNode(760, 270, 70, 50, 'Automation', 'Slack · email', '') +
+      rNode(80, 270, 200, 50, 'Recommendations', '', '') +
+      '</svg>';
+    cap = 'n8n owns orchestration and the outside world. The backend keeps data, rules, ML, and auth. Clean separation &mdash; easy to reason about, easy to scale.';
+  } else if (tab === 'daily') {
+    svg = '<svg width="400" height="1100" viewBox="0 0 400 1100">' + rDefs() +
+      '<rect class="rm-box" x="80" y="580" width="240" height="280" rx="12" />' +
+      rConn('M200,50 L200,80', true) + rConn('M200,130 L200,160', true) +
+      rConn('M200,210 L200,240', true) + rConn('M200,290 L200,320', true) +
+      rConn('M200,370 L200,400', true) + rConn('M200,450 L200,480', true) +
+      rConn('M200,530 L200,560', true) + rConn('M200,530 L320,530 L320,560', true) +
+      rConn('M200,610 L200,640', true) + rConn('M200,690 L200,720', true) +
+      rConn('M200,770 L200,800', true) + rConn('M200,850 L200,890', true) +
+      rConn('M200,940 L200,970', true) +
+      rNode(50, 0, 300, 50, '1  Schedule Trigger', 'Cron · every day 06:00', '') +
+      rNode(50, 80, 300, 50, '2  Fetch usage', 'HTTP Request → /internal/usage', '') +
+      rNode(50, 160, 300, 50, '3  Fetch support tickets', 'HTTP Request → /internal/support', '') +
+      rNode(50, 240, 300, 50, '4  Fetch latest feedback', 'HTTP Request → /internal/feedback', '') +
+      rNode(50, 320, 300, 50, '5  Aggregate signals', 'Function · 30/90-day windows', '') +
+      rNode(50, 400, 300, 50, '6  Health score', 'HTTP → /risk/breakdown (rule engine)', '') +
+      rNode(50, 480, 300, 50, '7  Churn probability', 'HTTP → /ml/predict (XGBoost)', '') +
+      rNode(100, 560, 200, 50, '8  IF risk gate', 'churn ≥ 0.50 OR band ∈ at-risk/critical', 'diamond') +
+      rNode(270, 560, 100, 50, 'Log: monitor', '', 'io') +
+      rNode(90, 640, 220, 50, '9  LLM · analyze why', 'AI node · grounded in signals', '') +
+      rNode(90, 720, 220, 50, '10 Retrieve playbook (RAG)', 'Vector search · top-1 of 10 playbooks', '') +
+      rNode(90, 800, 220, 50, '11 LLM · next-best-action', 'AI node · action constrained by rules', '') +
+      rNode(90, 890, 220, 50, '12 Generate CSM message', 'AI node · personalized draft', '') +
+      rNode(50, 970, 300, 50, '13 Store recommendation', 'HTTP → /analyses (Postgres)', '') +
+      rNode(50, 1050, 300, 50, '14 Notify CSM', 'Slack / Email · with Approve link', '') +
+      '<text x="210" y="630" font-size="11" fill="#475467" font-family="var(--font)">TRUE</text>' +
+      '<text x="235" y="525" font-size="11" fill="#475467" font-family="var(--font)">FALSE</text>' +
+      '</svg>';
+    cap = 'Same steps as orchestrator.analyze_customer() today &mdash; n8n adds the schedule, the fan-in fetches, retries, and the CSM notification.';
+  } else if (tab === 'event') {
+    svg = '<svg width="400" height="520" viewBox="0 0 400 520">' + rDefs() +
+      rConn('M200,50 L200,80', true) + rConn('M200,130 L200,160', true) +
+      rConn('M200,210 L200,240', true) + rConn('M200,210 L330,210 L330,240', true) +
+      rConn('M200,290 L200,320', true) +
+      rConn('M200,370 L200,400', true) + rConn('M200,370 L330,370 L330,400', true) +
+      rConn('M200,450 L200,480', true) +
+      rNode(50, 0, 300, 50, 'Webhook Trigger', 'Customer feedback / NPS submitted', '') +
+      rNode(50, 80, 300, 50, 'Sentiment analysis', 'AI node', '') +
+      rNode(100, 160, 200, 50, 'IF sentiment negative?', '', 'diamond') +
+      rNode(270, 240, 120, 50, 'End · store only', '', 'io') +
+      rNode(50, 240, 300, 50, 'Look up account risk', 'HTTP → /customers/{id}', '') +
+      rNode(100, 320, 200, 50, 'IF churn ≥ 0.70?', '', 'diamond') +
+      rNode(270, 400, 120, 50, 'Queue for daily run', '', 'io') +
+      rNode(50, 400, 300, 50, 'Escalate to CSM', 'Slack DM · P0', '') +
+      rNode(50, 480, 300, 50, 'Draft recommended response', 'AI node', '') +
+      '<text x="210" y="230" font-size="11" fill="#475467" font-family="var(--font)">YES</text>' +
+      '<text x="235" y="205" font-size="11" fill="#475467" font-family="var(--font)">NO</text>' +
+      '<text x="210" y="390" font-size="11" fill="#475467" font-family="var(--font)">YES</text>' +
+      '<text x="235" y="365" font-size="11" fill="#475467" font-family="var(--font)">NO</text>' +
+      '</svg>';
+    cap = "The nightly batch catches slow decline. Event triggers catch the sudden 'your update broke my reports' moment &mdash; the system reacts in seconds, not hours.";
+  } else if (tab === 'agent') {
+    svg = '<svg width="500" height="280" viewBox="0 0 500 280">' + rDefs() +
+      rConn('M250,50 L250,80', true) + rConn('M250,50 L125,80', true) + rConn('M250,50 L375,80', true) +
+      rConn('M125,130 L250,160', true) + rConn('M250,130 L250,160', true) + rConn('M375,130 L250,160', true) +
+      rConn('M250,210 L250,240', true) +
+      rNode(180, 0, 140, 50, 'n8n', '', 'accent') +
+      rNode(65, 80, 120, 50, 'Signal', 'agent', '') +
+      rNode(190, 80, 120, 50, 'Risk', 'agent', '') +
+      rNode(315, 80, 120, 50, 'Insight', 'agent', '') +
+      rNode(180, 160, 140, 50, 'Action agent', '', '') +
+      rNode(160, 240, 180, 50, 'Communication agent', '', '') +
+      '</svg>';
+    var cards = '<div style="display:flex;gap:16px;padding:16px;flex-wrap:wrap"><div class="io-card"><strong>SIGNAL AGENT</strong>\\n\\nin  { "login_change": -42, "ticket_count": 4, "nps_change": -6 }\\n\\nout { "signals": ["Significant usage decline","Support backlog",\\n                  "Negative customer sentiment"] }</div><div class="io-card"><strong>ACTION AGENT</strong>\\n\\nout { "action": "Executive health review", "priority": "P0",\\n      "reason": "High-value account with declining engagement" }</div></div>';
+    html = '<div class="rm-svg-wrap">' + svg + '</div>' + cards;
+    cap = 'Each agent is one focused prompt with structured output. n8n wires them; the backend still owns the deterministic risk math and the action catalog that constrains the Action agent.';
+  } else if (tab === 'who') {
+    html = '<div style="padding:24px"><table class="rm-table"><tbody>' +
+      '<tr><td style="font-weight:600;width:120px">React</td><td>User experience</td></tr>' +
+      '<tr><td style="font-weight:600">FastAPI</td><td>Application APIs, business rules, persistence, auth</td></tr>' +
+      '<tr><td style="font-weight:600">PostgreSQL</td><td>Source of truth (+ pgvector for playbook embeddings)</td></tr>' +
+      '<tr><td style="font-weight:600">XGBoost</td><td>Churn probability & feature attribution (SHAP)</td></tr>' +
+      '<tr><td style="font-weight:600">n8n</td><td>Orchestration, schedules, event triggers, AI workflow, external integrations, retries, observability</td></tr>' +
+      '<tr><td style="font-weight:600">LLM (Gemini)</td><td>Reasoning, root-cause explanation, message personalization</td></tr>' +
+      '</tbody></table>' +
+      '<div style="margin-top:24px;font-size:12px;color:var(--text-3)"><strong>n8n anti-patterns we avoid:</strong> Not doing: health-score math across 15 nodes &middot; React calling n8n for every click &middot; 10 LLM calls where 2 suffice.</div></div>';
+    cap = 'n8n for triggers → orchestration → AI steps → integrations → actions. Backend for data → APIs → rules → persistence → auth. Keeping the line clear is what makes the architecture mature &mdash; not pushing everything into workflow nodes.';
+  } else if (tab === 'live') {
+    html = '<div style="padding:24px;overflow-x:auto"><table class="rm-table" style="min-width:600px"><thead><tr><th style="width:50%">LIVE IN THIS BUILD</th><th style="width:50%">WITH n8n (production)</th></tr></thead><tbody>' +
+      '<tr><td>orchestrator.analyze_customer()</td><td>Same steps as a visual n8n workflow</td></tr>' +
+      '<tr><td>runs on the Analyze click</td><td>Scheduled nightly for all accounts</td></tr>' +
+      '<tr><td>Rule engine + XGBoost + RAG + LLM</td><td>unchanged (called via HTTP nodes)</td></tr>' +
+      '<tr><td>SQLite</td><td>PostgreSQL + pgvector</td></tr>' +
+      '<tr><td>In-memory cosine over 10 playbooks</td><td>pgvector similarity search</td></tr>' +
+      '<tr><td>CSM approves in the UI</td><td>+ Slack/email notify with deep link</td></tr>' +
+      '<tr><td>Manual re-analyze</td><td>Event triggers (negative feedback, payment failure, usage cliff)</td></tr>' +
+      '<tr><td>&mdash;</td><td>Retries, dead-letter, run history, outcome logging & feedback loop</td></tr>' +
+      '</tbody></table></div>';
+    cap = 'Nothing is faked. The pipeline is real and running now. n8n is the delivery layer: scheduling, events, integrations, and an ops canvas.';
+  }
+  
+  if (svg !== '') { html = '<div class="rm-svg-wrap">' + svg + '</div>'; }
+  rc.innerHTML = html + (cap ? '<div class="rm-caption">' + cap + '</div>' : '');
+  
+  // Stagger nodes in
+  setTimeout(function() {
+    rc.querySelectorAll('.rm-node').forEach(function(el, i) {
+      setTimeout(function(){ el.classList.add('in'); }, i * 120);
+    });
+  }, 50);
+}
+
+function switchRoadmapTab(tab) {
+  var strip = $id('roadmap-tabs-strip');
+  if (!strip) return;
+  strip.querySelectorAll('.how-tab').forEach(function(b) {
+    b.classList.remove('active');
+    if (b.getAttribute('data-rtab') === tab) b.classList.add('active');
+  });
+  renderRoadmapTab(tab);
+}
+
+function openRoadmapModal(tab) {
+  $id('how-modal').classList.add('hidden'); // close other
+  var rm = $id('roadmap-modal');
+  if (!rm) return;
+  rm.classList.remove('hidden');
+  switchRoadmapTab(typeof tab === 'string' ? tab : 'architecture');
+}
+
+function startApp() {
+  $id('signout-btn').style.display = 'block';
+  
+  if (localStorage.getItem('cra_onboarded') !== '1') {
+    openHowModal('pipeline');
+  }
+
+  window.addEventListener('hashchange', route);
+  
+  var rb = $id('roadmap-btn'); if(rb) rb.addEventListener('click', openRoadmapModal);
+  var rmx = $id('roadmap-close-x'); if(rmx) rmx.addEventListener('click', function(){ $id('roadmap-modal').classList.add('hidden'); });
+  var rts = $id('roadmap-tabs-strip');
+  if (rts) {
+    rts.addEventListener('click', function(e) {
+      if (e.target.classList.contains('how-tab')) switchRoadmapTab(e.target.getAttribute('data-rtab'));
+    });
+  }
+  
+  // Also hook Esc key for roadmap-modal
+  document.addEventListener('keydown', function(e) {
+    if (e.key === 'Escape') {
+      if (!$id('roadmap-modal').classList.contains('hidden')) {
+        $id('roadmap-modal').classList.add('hidden');
+        if (rb) rb.focus();
+      }
+    }
+  });
+
+  route();
+  checkHealth();
+  if (!window._healthInt) window._healthInt = setInterval(checkHealth, 60000);
+}
+
+$id('signout-btn').addEventListener('click', async function() {
+  try { await api('/api/logout', { method: 'POST' }); } catch(e) {}
+  S.dashboard = null; S.currentDetail = null;
+  window.removeEventListener('hashchange', route);
+  if (window._healthInt) { clearInterval(window._healthInt); window._healthInt = null; }
+  renderLogin();
+});
+
+async function boot() {
+  try {
+    await api('/api/me');
+    startApp();
+  } catch(e) {
+    if (e.status === 401) {
+      renderLogin();
+    } else {
+      setMain('<div class="empty-state">System unavailable.</div>');
+    }
+  }
+}
+boot();
+</script>
+</body>
+</html>

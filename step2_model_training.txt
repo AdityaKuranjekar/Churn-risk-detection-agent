@@ -1,0 +1,384 @@
+===============================================================================
+STEP 2 — FEATURE ENGINEERING + MODEL TRAINING  (ml/train_model.py)
+Churn Risk Agent  ·  detailed end-to-end implementation plan
+===============================================================================
+
+GOAL
+----
+Read the `customers` table from churn_agent.db, engineer a fixed feature set,
+train an XGBoost churn classifier, evaluate it honestly (imbalanced data),
+and persist everything inference needs:
+
+    ml/churn_model.pkl        trained xgboost.XGBClassifier
+    ml/feature_columns.pkl    exact ordered list of feature names
+    ml/preprocess.pkl         encoders / imputer stats / scaler (if any)
+    ml/model_card.json        metrics + params + data snapshot (for slides)
+    ml/feature_importance.png  bar chart (for slides / LinkedIn)
+
+NON-GOALS
+---------
+- No deep learning, no hyperparameter search beyond a tiny grid.
+- No leakage-prone features (see PHASE 2 leakage rules).
+- The deterministic health-score (Step 3) is SEPARATE — this file only
+  produces P(churn). Keep them decoupled.
+
+KEY CONSTRAINT: churn rate ~10.2%  (IMBALANCED).
+  -> stratify every split
+  -> scale_pos_weight = n_neg / n_pos  (~8.8)
+  -> headline metric = ROC-AUC + PR-AUC + churn-class precision/recall
+  -> NEVER report plain accuracy as success (0.90 is the do-nothing baseline)
+
+
+-------------------------------------------------------------------------------
+OUTPUT CONTRACT  (Step 5 ml_model.py + Step 7 orchestrator depend on this)
+-------------------------------------------------------------------------------
+feature_columns.pkl  = ordered python list[str], e.g.:
+    ["tenure_days", "monthly_charges", "arr", "plan_tier_ord", "num_devices",
+     "age", "payment_failures", "support_contacts", "engagement_score",
+     "last_login_days", "usage_level", "usage_per_tenure",
+     "charges_per_device", "is_month_to_month", "high_support_flag",
+     "recent_inactivity_flag", "usage_trend"]         # final list set in code
+
+predict contract (implemented in Step 5, defined here):
+    predict(feature_dict: dict) -> float in [0,1]
+      - build a 1-row DataFrame in feature_columns order
+      - missing key -> impute with saved training median (from preprocess.pkl)
+      - same encoding as training (plan_tier_ord already numeric from Step 1)
+      - return model.predict_proba(X)[0, 1]
+
+model_card.json keys:
+    trained_at, n_rows, n_features, churn_rate, split_seed,
+    params, cv_auc_mean, cv_auc_std, test_auc, test_pr_auc,
+    test_precision_churn, test_recall_churn, test_f1_churn,
+    threshold_used, confusion_matrix, top_10_features
+
+
+-------------------------------------------------------------------------------
+PHASE 0 — DEPS + SKELETON  (~5 min)
+-------------------------------------------------------------------------------
+Add to requirements.txt (install now):
+    xgboost
+    scikit-learn
+    matplotlib
+    joblib
+    (pandas, numpy, SQLAlchemy already installed)
+
+    pip install xgboost scikit-learn matplotlib joblib
+
+File: ml/train_model.py   CLI shape:
+    python ml/train_model.py                 # full train + eval + save
+    python ml/train_model.py --no-save       # dry run, print metrics only
+    python ml/train_model.py --explain       # also SHAP summary (optional)
+    python ml/train_model.py --grid          # run the small param grid
+
+main():
+    load .env (DATABASE_URL, SEED)
+    df   = load_customers()
+    df   = add_usage_trend(df)          # optional, demo-subset only
+    X, y, feat_cols, pre = build_features(df)
+    model, metrics = train_eval(X, y, feat_cols)
+    if save: persist(model, feat_cols, pre, metrics)
+    print_report(metrics)
+
+
+-------------------------------------------------------------------------------
+PHASE 1 — LOAD DATA  (load_customers)
+-------------------------------------------------------------------------------
+    from sqlalchemy import create_engine
+    import pandas as pd
+    eng = create_engine(os.environ.get("DATABASE_URL", "sqlite:///./churn_agent.db"))
+    df = pd.read_sql("SELECT * FROM customers", eng)
+
+Checks (fail fast with a clear message):
+  - df non-empty
+  - "churn_label" column present AND not all-null
+        if all null -> ABORT: "Step 1 produced no churn label; retrain impossible"
+  - drop rows where churn_label is null (can't train on them); log how many
+  - y = df["churn_label"].astype(int)
+  - print: n rows, churn rate, class counts
+
+TRAIN ON THE FULL SET (all customers, not just is_demo).
+is_demo is only for the dashboard; the model wants all the signal it can get.
+
+
+-------------------------------------------------------------------------------
+PHASE 2 — FEATURE ENGINEERING  (build_features)  + LEAKAGE RULES
+-------------------------------------------------------------------------------
+2A. LEAKAGE / EXCLUSION RULES  (drop these from X, always):
+    - id, ext_id, name, email                (identifiers)
+    - churn_label                            (target)
+    - is_demo                                (bookkeeping)
+    - signup_date, renewal_date              (raw dates -> use derived numerics)
+    - anything Step 1 synthesized DIRECTLY FROM churn_label with no noise.
+      From Step 1: usage_daily trend slope and feedback sentiment were shaped
+      using churn_label. Therefore:
+        * DO NOT use feedback-derived aggregates as features.
+        * usage_trend (from usage_daily) is BORDERLINE — it was generated with
+          a churn-dependent slope. Default: EXCLUDE it from the model to avoid
+          circular "prediction". Optionally train a second model WITH it and
+          compare AUC in the model card, clearly labelled "includes
+          synthetic-trend feature (leaky) — for illustration only".
+    - last_login_days: in Step 1 this was EITHER real-from-CSV OR synthesized
+      with a churn-dependent shift. Check meta.column_map:
+        if the CSV had a real last-login column -> KEEP last_login_days.
+        if it was synthesized -> KEEP but flag in model card as
+          "partially target-informed"; it's still a legitimate behavioral
+          proxy and the dataset itself claims realistic correlations.
+      (Practical call for a hackathon: keep it, disclose it.)
+
+2B. BASE FEATURES (straight from customers, numeric already):
+    tenure_days, monthly_charges, arr, plan_tier_ord, num_devices, age,
+    payment_failures, support_contacts, engagement_score, last_login_days,
+    usage_level
+
+    Missing-value handling:
+      - age may be null -> impute median, add `age_missing` (0/1) flag
+      - num_devices null -> 1
+      - engagement_score null -> median
+      - everything else should be complete out of Step 1
+
+2C. DERIVED FEATURES (cheap, non-leaky, add explanatory power):
+    usage_per_tenure     = usage_level / (tenure_days + 1)
+    charges_per_device   = monthly_charges / (num_devices)
+    arr_to_usage         = arr / (usage_level + 1)
+    tenure_bucket        = pd.cut(tenure_days, [0,90,365,730,4000]) -> ordinal
+    is_month_to_month    = (plan_tier_ord == 0).astype(int)
+    high_support_flag    = (support_contacts >= 2).astype(int)
+    payment_risk_flag    = (payment_failures >= 1).astype(int)
+    recent_inactivity_flag = (last_login_days >= 21).astype(int)
+    low_engagement_flag  = (engagement_score < engagement_score.median()).astype(int)
+
+2D. CATEGORICAL ENCODING:
+    plan_tier_ord        already 0/1/2 -> leave as-is (ordinal is fine for trees)
+    gender               -> one-hot (gender_Male, gender_Female, gender_Other);
+                            if too sparse or mostly null, DROP.
+    region               -> high-cardinality risk. If <= 8 distinct: one-hot.
+                            else: frequency-encode (map value -> its % share)
+                            or DROP for v1. Record choice in model card.
+
+2E. FINALIZE:
+    - assemble X = df[selected + derived + encoded]
+    - feat_cols = list(X.columns)                (THIS is feature_columns.pkl)
+    - X = X.apply(pd.to_numeric, errors="coerce")
+    - store medians: pre = {"medians": X.median().to_dict(),
+                            "feature_columns": feat_cols,
+                            "region_encoding": ...,
+                            "gender_dummies": [...]}
+    - X = X.fillna(pd.Series(pre["medians"]))
+    - assert no NaN, no inf:  X.replace([inf,-inf], nan) then check
+    - print correlation of each feature with y (abs, sorted) — quick smell test
+      (any |corr| > 0.95 => almost certainly leakage, investigate before training)
+
+
+-------------------------------------------------------------------------------
+PHASE 3 — SPLIT  (stratified, seeded)
+-------------------------------------------------------------------------------
+    from sklearn.model_selection import train_test_split, StratifiedKFold
+    SEED = int(os.environ.get("SEED", 42))
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.20, stratify=y, random_state=SEED)
+
+    # keep the test set untouched until final eval
+    # class weight from TRAIN ONLY:
+    n_pos = int(y_train.sum()); n_neg = len(y_train) - n_pos
+    spw = n_neg / max(n_pos, 1)          # ~8.8
+
+Do NOT oversample the test set. If you try SMOTE, apply it INSIDE CV folds on
+train only (via imblearn Pipeline) — but for this dataset scale_pos_weight is
+enough; SMOTE is optional and off by default.
+
+
+-------------------------------------------------------------------------------
+PHASE 4 — MODEL + CROSS-VALIDATION  (train_eval)
+-------------------------------------------------------------------------------
+Base params:
+    import xgboost as xgb
+    params = dict(
+        n_estimators=300,
+        max_depth=4,
+        learning_rate=0.05,
+        subsample=0.9,
+        colsample_bytree=0.9,
+        min_child_weight=2,
+        reg_lambda=1.0,
+        objective="binary:logistic",
+        eval_metric="aucpr",          # PR-AUC: right metric for imbalance
+        scale_pos_weight=spw,
+        random_state=SEED,
+        n_jobs=-1,
+    )
+
+4A. Stratified 5-fold CV on the TRAIN set:
+    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=SEED)
+    for each fold:
+        fit on fold-train (optionally with early stopping on fold-val,
+          early_stopping_rounds=30, eval_set=[(Xv,yv)])
+        record roc_auc, pr_auc on fold-val
+    report cv_auc_mean +/- cv_auc_std, cv_pr_auc_mean +/- std
+    -> this is the number you TRUST and put on the slide
+
+4B. --grid (optional, small, ~1-2 min):
+    grid = {
+      "max_depth": [3, 4, 5],
+      "learning_rate": [0.03, 0.05, 0.1],
+      "n_estimators": [200, 300, 500],
+    }
+    use sklearn GridSearchCV(scoring="average_precision", cv=skf, refit=True)
+    pick best by mean PR-AUC; log full table to model_card.
+
+4C. Fit FINAL model on ALL of X_train with best params.
+    (If you used early stopping, carve a small stratified val slice from
+     X_train for the eval_set, or just fix n_estimators from CV.)
+
+
+-------------------------------------------------------------------------------
+PHASE 5 — EVALUATE ON HELD-OUT TEST  (once)
+-------------------------------------------------------------------------------
+    proba = model.predict_proba(X_test)[:, 1]
+
+    from sklearn.metrics import (roc_auc_score, average_precision_score,
+        precision_recall_curve, classification_report, confusion_matrix,
+        f1_score)
+
+    test_auc     = roc_auc_score(y_test, proba)
+    test_pr_auc  = average_precision_score(y_test, proba)
+
+5A. CHOOSE AN OPERATING THRESHOLD (don't just use 0.5):
+    - sweep thresholds on the PR curve
+    - pick the threshold that maximizes F1 for the churn class
+      OR the lowest threshold with precision >= 0.50 (business call:
+      "when we flag someone, we want to be right half the time")
+    - store as threshold_used; ALSO keep CHURN_THRESHOLD from .env (0.50) as
+      the orchestrator's gate on the PROBABILITY (they're different knobs:
+      one classifies, one decides whether to run the LLM). Document both.
+
+5B. Report at threshold_used:
+    preds = (proba >= threshold_used).astype(int)
+    print(classification_report(y_test, preds, digits=3))
+    cm = confusion_matrix(y_test, preds)   # [[TN,FP],[FN,TP]]
+    precision_churn, recall_churn, f1_churn for class 1
+
+5C. Baseline comparison (put in model card, great for the writeup):
+    - "predict majority (no churn)": accuracy ~0.898, recall_churn = 0
+    - "logistic regression, class_weight=balanced": quick fit, report AUC
+    - XGBoost delta vs both
+
+5D. Calibration sanity (optional): reliability curve / Brier score. If badly
+    miscalibrated, wrap with CalibratedClassifierCV(method="isotonic", cv=5)
+    on train and re-check — matters because the UI SHOWS the probability as
+    "87%". Note in card whether calibration was applied.
+
+
+-------------------------------------------------------------------------------
+PHASE 6 — EXPLAINABILITY ARTIFACTS
+-------------------------------------------------------------------------------
+6A. Feature importance (always):
+    imp = model.feature_importances_  (gain-based: model.get_booster()
+          .get_score(importance_type="gain"))
+    sort desc, take top 15, matplotlib barh -> ml/feature_importance.png
+    also dump top_10_features (name, gain) into model_card.json
+
+6B. --explain (optional, if `shap` installed):
+    import shap
+    expl = shap.TreeExplainer(model)
+    sv = expl.shap_values(X_test)
+    shap.summary_plot(sv, X_test, show=False) -> ml/shap_summary.png
+    (This directly supports the "Explainable AI" bullet from the dataset card.)
+
+6C. Per-customer explanation helper (used later by Step 3/UI, define here):
+    def explain_one(feature_dict) -> list[{feature, value, shap_contribution}]
+    Keep it in ml/train_model.py or a small ml/explain.py; Step 3's
+    risk_breakdown() is rule-based and independent, but showing top SHAP
+    drivers next to it is a nice "two methods agree" moment.
+
+
+-------------------------------------------------------------------------------
+PHASE 7 — PERSIST  (persist)
+-------------------------------------------------------------------------------
+    import joblib, json, datetime
+    joblib.dump(model, "ml/churn_model.pkl")
+    joblib.dump(feat_cols, "ml/feature_columns.pkl")
+    joblib.dump(pre, "ml/preprocess.pkl")          # medians, encoders, dummies
+    json.dump(model_card, open("ml/model_card.json","w"), indent=2)
+    (feature_importance.png already written)
+
+model_card must capture the DATA SNAPSHOT so you know if the model is stale:
+    "source_table": "customers",
+    "n_rows": ..., "churn_rate": ...,
+    "step1_reference_date": <read from meta table>,
+    "column_map": <read from meta table>            # provenance
+
+VERSIONING: also copy to ml/churn_model_<YYYYMMDD_HHMM>.pkl so you can roll
+back if a retrain regresses. Keep churn_model.pkl as the "current" pointer.
+
+
+-------------------------------------------------------------------------------
+PHASE 8 — SELF-CHECK  (--validate style, run at end of every train)
+-------------------------------------------------------------------------------
+  [ ] feature_columns.pkl length == X.shape[1]
+  [ ] reload model + predict on 3 hand-built dicts:
+        healthy  (long tenure, high engagement, 0 failures, recent login)
+        critical (short tenure, low engagement, 3 failures, 40d no login)
+        mid
+      -> assert p(healthy) < p(mid) < p(critical)   (monotonic sanity)
+  [ ] predict handles a dict MISSING 2 keys (median-impute path works)
+  [ ] predict output strictly in [0,1]
+  [ ] no feature in feat_cols has |corr with y| > 0.95 (leakage tripwire)
+  [ ] test_auc >= 0.75  (soft gate; if lower, revisit features before moving on)
+  [ ] test_recall_churn >= 0.40 at threshold_used (else tune threshold/spw)
+  [ ] model_card.json written and readable
+Print "READY FOR STEP 3" banner on pass.
+
+
+-------------------------------------------------------------------------------
+PHASE 9 — HOW STEP 5 (ml_model.py) WILL CONSUME THIS  (write stub now)
+-------------------------------------------------------------------------------
+    # app/services/ml_model.py   (skeleton to drop in during Step 5)
+    import joblib, numpy as np, pandas as pd, os
+    _M = joblib.load("ml/churn_model.pkl")
+    _C = joblib.load("ml/feature_columns.pkl")
+    _P = joblib.load("ml/preprocess.pkl")
+
+    def _row(feature_dict: dict) -> pd.DataFrame:
+        r = {c: feature_dict.get(c, _P["medians"][c]) for c in _C}
+        return pd.DataFrame([r], columns=_C)
+
+    def predict(feature_dict: dict) -> float:
+        return float(_M.predict_proba(_row(feature_dict))[0, 1])
+
+    def build_feature_dict_from_customer(cust_row: dict) -> dict:
+        # MUST mirror PHASE 2C derived features exactly.
+        # Factor the derivation into a shared function imported by BOTH
+        # train_model.py and ml_model.py (e.g. ml/features.py) so training
+        # and inference can never drift. DO THIS — it's the #1 bug source.
+    -> RECOMMENDATION: create ml/features.py NOW with:
+         BASE_COLS, derive_features(df_or_dict) -> df, FINAL_FEATURE_ORDER
+       import it from train_model.py in Phase 2.
+
+
+-------------------------------------------------------------------------------
+PHASE 10 — DELIVERABLES CHECKLIST FOR STEP 2
+-------------------------------------------------------------------------------
+  [ ] ml/features.py       shared feature derivation (single source of truth)
+  [ ] ml/train_model.py    CLI: default / --no-save / --grid / --explain
+  [ ] churn_model.pkl, feature_columns.pkl, preprocess.pkl written
+  [ ] model_card.json with CV AUC, test AUC, PR-AUC, precision/recall/F1
+      for the churn class, confusion matrix, chosen threshold, baselines
+  [ ] feature_importance.png (and shap_summary.png if --explain)
+  [ ] PHASE 8 self-check prints READY FOR STEP 3
+  [ ] screenshot the metrics block -> for slides / LinkedIn (Step 12)
+  [ ] commit ml/*.py + the .pkl files + model_card.json (Render needs the
+      pkls, or start.sh retrains on boot — committing is faster/safer)
+
+
+WATCH-OUTS
+  - Imbalance: never celebrate accuracy. Lead with AUC / PR-AUC / recall.
+  - Leakage: feedback-derived features are OUT; disclose last_login provenance.
+  - Train/infer drift: derive features in ONE shared module (ml/features.py).
+  - The .env CHURN_THRESHOLD (0.50) gates the LLM step; the model's
+    threshold_used is for classification metrics — keep the two concepts
+    separate and documented.
+NEXT: Step 3 — services/scoring.py (deterministic risk_breakdown) +
+      services/action_catalog.py (pick_base_action).
+===============================================================================

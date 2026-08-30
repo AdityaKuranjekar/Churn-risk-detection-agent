@@ -1,0 +1,491 @@
+===============================================================================
+STEP 1 — DATA INGESTION  (load_dataset.py)
+Churn Risk Agent  ·  detailed end-to-end implementation plan
+===============================================================================
+
+GOAL
+----
+Turn the raw Kaggle CSV (data/customer_churn_raw.csv) into a clean SQLite
+database (churn_agent.db) with 4 tables the rest of the app reads from:
+
+    customers      one row per customer  (+ churn_label, training only)
+    usage_daily    ~30 synthetic daily rows per customer (usage time series)
+    feedback       0-3 synthetic support/NPS/review rows per customer
+    meta           tiny key/value table: run timestamp, row counts, column map
+
+The Kaggle dataset is a FLAT per-customer table (demographics, product usage,
+billing/payment history, support interactions, engagement metrics, churn).
+It has NO time series and NO free-text feedback, so usage_daily and feedback
+are SYNTHESIZED from the flat columns in a deterministic, seeded way.
+
+OUTPUT CONTRACT (what later steps depend on — do not rename without updating them)
+-------------------------------------------------------------------------------
+customers columns:
+    id                INTEGER PK
+    ext_id            TEXT     original customer id from CSV (or row index)
+    name              TEXT     synthetic display name (Faker-free, see below)
+    email             TEXT     synthetic
+    plan_tier         TEXT     one of: Basic | Standard | Premium
+    plan_tier_ord     INTEGER  0 | 1 | 2   (Basic=0)
+    tenure_days       INTEGER
+    signup_date       TEXT (ISO date)
+    renewal_date      TEXT (ISO date)
+    num_devices       INTEGER  (nullable -> 1)
+    monthly_charges   REAL
+    arr               REAL     monthly_charges * 12
+    age               INTEGER  (nullable)
+    gender            TEXT     (nullable)
+    region            TEXT     (nullable)
+    payment_failures  INTEGER  (0 if absent)
+    support_contacts  INTEGER  (0 if absent)
+    engagement_score  REAL     0-100 normalized (see step 6)
+    last_login_days   INTEGER  days since last login (derived / synthesized)
+    usage_level       REAL     current period usage (minutes or sessions)
+    churn_label       INTEGER  0 | 1     (NULL if the CSV has no label)
+    is_demo           INTEGER  1 if part of the ~40-customer demo subset
+
+usage_daily columns:
+    id, customer_id (FK), date (ISO), active_minutes REAL, logins INTEGER,
+    sessions INTEGER, feature_events INTEGER
+
+feedback columns:
+    id, customer_id (FK), date (ISO), channel TEXT (support|nps|review),
+    text TEXT, sentiment REAL (-1..1), is_complaint INTEGER (0|1)
+
+meta columns:
+    key TEXT PK, value TEXT
+
+
+-------------------------------------------------------------------------------
+PHASE 0 — PROJECT SCAFFOLD (once, ~5 min)
+-------------------------------------------------------------------------------
+Create folders/files if missing:
+
+    churn-agent/
+      data/                      (already exists)
+      app/  app/routers/  app/services/
+      ml/
+      frontend/
+      load_dataset.py            <-- THIS STEP
+      requirements.txt
+      .env                       (already exists)
+
+requirements needed for THIS step only:
+    pandas
+    numpy
+    python-dotenv
+    SQLAlchemy
+    (xgboost / fastapi etc. not needed until later steps)
+
+Run:
+    pip install pandas numpy python-dotenv SQLAlchemy
+
+Confirm Python:
+    python --version        (need 3.10+)
+
+
+-------------------------------------------------------------------------------
+PHASE 1 — INSPECT THE REAL CSV  (run once, interactively, ~10 min)
+-------------------------------------------------------------------------------
+Before writing mapping code, SEE the actual columns. Add a --inspect mode to
+load_dataset.py (or a scratch cell):
+
+    import pandas as pd
+    df = pd.read_csv("data/customer_churn_raw.csv")
+    print("shape:", df.shape)
+    print("\ncolumns:", list(df.columns))
+    print("\ndtypes:\n", df.dtypes)
+    print("\nnull counts:\n", df.isna().sum())
+    print("\nhead:\n", df.head(10).to_string())
+    for c in df.columns:
+        if df[c].dtype == "object" or df[c].nunique() < 15:
+            print(f"\n{c}  unique({df[c].nunique()}): {df[c].unique()[:15]}")
+    print("\nnumeric describe:\n", df.describe().T.to_string())
+
+WHAT TO WRITE DOWN (fill the COLUMN MAP, see Phase 2):
+  - exact name of the CHURN label column + its values
+        (Yes/No? 1/0? True/False? "Churned"/"Active"?)
+  - customer id column (if any)
+  - plan/subscription tier column + its distinct values
+  - tenure column + its UNIT (days? months? years?)
+  - monthly charge / price column
+  - any usage columns (minutes watched, hours, sessions, logins,
+        usage_frequency, number_of_logins, avg_session_length, ...)
+  - last login / last activity column (a date? a "days since"? weeks?)
+  - payment failure / failed payments / billing issues column
+  - support tickets / complaints / customer service calls column
+  - engagement score column (if present)
+  - device count / number_of_devices column
+  - demographics: age, gender, region/country/state
+  - anything else numeric that looks behavioral
+
+NOTE the dataset is synthetic ("business-driven rules + probabilistic noise"),
+so expect clean-ish data: few nulls, sensible ranges, balanced-ish churn.
+
+
+-------------------------------------------------------------------------------
+PHASE 2 — THE COLUMN MAP  (config block at top of load_dataset.py)
+-------------------------------------------------------------------------------
+Centralize every CSV->canonical mapping in ONE dict so tweaking after
+inspection is a 1-line change. Use lists of candidate names + a resolver that
+picks the first column that exists (case-insensitive, ignore spaces/underscores).
+
+    RAW = "data/customer_churn_raw.csv"
+    DB  = "churn_agent.db"
+    SEED = 42
+    DEMO_SUBSET_SIZE = 40           # from .env DEMO_SUBSET_SIZE
+    USAGE_HISTORY_DAYS = 30
+
+    CANDIDATES = {
+      "ext_id":          ["customer_id", "customerID", "id", "user_id"],
+      "churn":           ["churn", "churned", "is_churn", "exited", "target",
+                          "attrition", "churn_flag", "churn_label"],
+      "plan_tier":       ["plan_type", "subscription_type", "plan", "tier",
+                          "contract", "subscription_plan"],
+      "tenure":          ["tenure", "tenure_months", "tenure_days",
+                          "months_subscribed", "account_age", "customer_tenure"],
+      "monthly_charges": ["monthly_charges", "monthlycharges", "monthly_bill",
+                          "monthly_fee", "price", "subscription_fee", "mrr"],
+      "total_charges":   ["total_charges", "totalcharges", "lifetime_value",
+                          "total_spent"],
+      "last_login":      ["last_login", "last_active", "last_activity_date",
+                          "days_since_last_login", "last_seen",
+                          "weeks_since_last_login"],
+      "usage":           ["usage_frequency", "avg_watch_time", "watch_hours",
+                          "hours_watched", "sessions_per_week",
+                          "avg_session_length", "usage_minutes",
+                          "number_of_logins", "login_frequency",
+                          "monthly_usage", "activity_score"],
+      "payment_failures":["payment_failures", "failed_payments",
+                          "num_failed_payments", "billing_issues",
+                          "payment_delay", "late_payments"],
+      "support_contacts":["support_tickets", "num_support_tickets",
+                          "customer_service_calls", "complaints",
+                          "support_calls", "num_complaints", "tickets_raised"],
+      "engagement":      ["engagement_score", "engagement", "activity_level",
+                          "satisfaction_score", "nps", "csat"],
+      "num_devices":     ["num_devices", "number_of_devices", "devices",
+                          "device_count"],
+      "age":             ["age", "customer_age"],
+      "gender":          ["gender", "sex"],
+      "region":          ["region", "country", "state", "location", "geography"],
+      "signup_date":     ["signup_date", "join_date", "registration_date",
+                          "start_date", "subscription_start"],
+    }
+
+    def resolve(df, key):
+        norm = {c.lower().replace(" ", "").replace("_", ""): c for c in df.columns}
+        for cand in CANDIDATES.get(key, []):
+            k = cand.lower().replace(" ", "").replace("_", "")
+            if k in norm:
+                return norm[k]
+        return None          # caller decides: synthesize or error
+
+HARD REQUIREMENT: `churn` must resolve for TRAINING (Step 2). If it does not,
+stop and eyeball the CSV manually, then add the real name to CANDIDATES.
+Everything else has a synthesize-or-default fallback.
+
+
+-------------------------------------------------------------------------------
+PHASE 3 — LOAD + CLEAN  (build_customers(df) -> DataFrame)
+-------------------------------------------------------------------------------
+1. Read CSV:  df = pd.read_csv(RAW)
+2. Drop exact-duplicate rows.  df = df.drop_duplicates()
+3. Strip whitespace on all object columns:
+       for c in df.select_dtypes("object"): df[c] = df[c].str.strip()
+4. Resolve each canonical field via resolve(df, key).
+5. Build a NEW clean frame `cust` column by column:
+
+   ext_id:
+       from resolved col if present else df.index.astype(str)
+
+   churn_label:
+       raw = df[churn_col]
+       map to {0,1}:  yes/y/true/1/churned/exited -> 1 ;
+                      no/n/false/0/active/retained -> 0
+       (lowercase string compare; numeric already 0/1 -> int)
+       if unmappable values remain -> raise (bad column guess)
+
+   plan_tier / plan_tier_ord:
+       resolved plan col -> title-case string.
+       Normalize synonyms to Basic/Standard/Premium:
+         basic/standard/premium kept as-is
+         month-to-month/monthly/short  -> Basic
+         one_year/standard/annual      -> Standard
+         two_year/premium/pro/plus     -> Premium
+       If plan col missing: assign by monthly_charges terciles
+         (low->Basic, mid->Standard, high->Premium); if that's also missing,
+         all "Standard".
+       plan_tier_ord = {Basic:0, Standard:1, Premium:2}[plan_tier]
+
+   tenure_days:
+       resolved tenure col. Detect unit:
+         col name contains "day"   -> value as-is
+         contains "month" OR max(value) < 120 -> value * 30
+         contains "year"  OR max(value) < 15  -> value * 365
+         else assume days
+       clip to [1, 4000]; fillna(median).
+
+   monthly_charges:
+       resolved col -> float; fillna(median).
+       if missing entirely: derive from plan_tier
+         (Basic 9.99, Standard 15.49, Premium 19.99) — adjust to dataset scale.
+   arr = monthly_charges * 12
+
+   signup_date:
+       if resolved date col -> parse to datetime.
+       else: signup_date = TODAY - tenure_days
+       (TODAY = date from run; use a fixed REFERENCE_DATE = 2026-08-30 so
+        reruns are stable — pull from currentDate / .env if you want.)
+   renewal_date:
+       period = 30d (Basic) / 365d (Standard) / 365d (Premium)  [tune]
+       renewal_date = signup_date + ceil(tenure_days / period_days) * period_days
+       -> the NEXT renewal boundary after "now".
+
+   num_devices:      resolved -> int; fillna(1); clip [1, 10]
+   age:              resolved -> int; nullable
+   gender / region:  resolved -> str; nullable
+
+   payment_failures: resolved -> int; missing -> 0; clip [0, 20]
+   support_contacts: resolved -> int; missing -> 0; clip [0, 50]
+
+   usage_level:
+       resolved usage col -> float.
+       if multiple usage-ish cols exist, keep the most "volume-like" one as
+       usage_level and stash the others as extra numeric features for Step 2
+       (write them to a JSON blob column `raw_features` on customers — handy
+       for training; optional).
+       if NO usage col: synthesize from engagement/among behavior:
+         usage_level = 300 * sigmoid(z(engagement)) + noise   (minutes/month)
+       Normalize/keep raw; Step 2 will scale.
+
+   engagement_score (0-100):
+       if resolved engagement col: min-max scale to 0-100.
+       else compute a proxy 0-100 from usage_level percentile (70%) +
+         inverse last_login_days percentile (30%).
+
+   last_login_days:
+       if resolved col is a DATE  -> (REFERENCE_DATE - date).days
+       if it's "weeks since"      -> value * 7
+       if it's already "days since"-> value as-is
+       if missing -> synthesize:
+         base = np.random.default_rng(SEED).gamma(shape=2, scale=4, size=n)
+         churned customers get + a shift (e.g. *2.0) so recency correlates
+         with churn (matches the dataset's "realistic correlations" claim).
+       clip [0, 365].
+
+6. Attach synthetic identity (no external libs):
+       FIRST = ["Alex","Sam","Jordan","Riya","Neha","Arjun","Maya","Dev",
+                "Priya","Rahul","Zoe","Ken","Ana","Leo","Ivy","Omar", ...]
+       LAST  = ["Sharma","Patel","Khan","Rao","Iyer","Nair","Bose","Das",
+                "Mehta","Singh","Roy","Jain","Kapoor","Reddy", ...]
+       rng = np.random.default_rng(SEED)
+       name = rng.choice(FIRST)+" "+rng.choice(LAST) (dedupe by appending ext_id)
+       email = f"{first.lower()}.{last.lower()}{i}@example.com"
+
+7. Sanity asserts before returning:
+       assert cust["churn_label"].isin([0,1]).all() or churn_missing
+       assert cust["plan_tier"].isin(["Basic","Standard","Premium"]).all()
+       assert (cust["tenure_days"] > 0).all()
+       assert cust["monthly_charges"].gt(0).all()
+       print a summary: n rows, churn rate, plan distribution, null report.
+
+
+-------------------------------------------------------------------------------
+PHASE 4 — DEMO SUBSET  (pick ~40 customers spanning healthy -> critical)
+-------------------------------------------------------------------------------
+Purpose: the dashboard should show a readable spread, not 5000 rows.
+
+1. Compute a quick provisional risk score (rule-of-thumb, NOT the Step 2 model):
+       risk = z(last_login_days)*0.3
+            + z(payment_failures)*0.25
+            + z(support_contacts)*0.2
+            - z(engagement_score)*0.15
+            - z(usage_level)*0.10
+2. Bucket into 4 quartiles: critical / at_risk / watch / healthy.
+3. From each bucket sample DEMO_SUBSET_SIZE/4 rows, stratified so BOTH
+   churn_label values appear in each bucket where possible.
+   rng = np.random.default_rng(SEED) for reproducibility.
+4. Mark is_demo = 1 on those; 0 on the rest.
+5. Keep ALL rows in the DB (full set needed for Step 2 training); the API
+   will filter `WHERE is_demo = 1` for the dashboard, and training reads all.
+
+
+-------------------------------------------------------------------------------
+PHASE 5 — SYNTHESIZE usage_daily  (30 rows per customer)
+-------------------------------------------------------------------------------
+For each customer, generate USAGE_HISTORY_DAYS days ending REFERENCE_DATE.
+
+Shape the trend so it MATCHES the customer's state (this is what makes the
+"declining usage" warning signal visible in the UI and to the LLM):
+
+    rng = np.random.default_rng(SEED + customer_int_id)   # per-customer stable
+    mean_daily = max(usage_level / 30.0, 1.0)             # minutes/day baseline
+
+    # trend direction:
+    if churn_label == 1 or provisional_bucket in (critical, at_risk):
+        slope = uniform(-0.06, -0.03)      # steady decline (fraction/day)
+    elif provisional_bucket == watch:
+        slope = uniform(-0.02, 0.0)
+    else:
+        slope = uniform(-0.005, 0.01)      # flat / slight growth
+
+    day t in [0..29] (0 = oldest):
+        factor = 1 + slope * (29 - t)       # higher factor in the past
+        active_minutes = max(0, mean_daily * factor * rng.normal(1, 0.25))
+        # inject "gone quiet" tail for high last_login_days:
+        if (29 - t) < last_login_days:      # no activity since last login
+            active_minutes = 0
+        sessions  = 0 if active_minutes == 0 else max(1, round(active_minutes/35 + rng.normal(0,0.5)))
+        logins    = 0 if sessions == 0 else max(1, round(sessions * rng.uniform(0.6, 1.0)))
+        feature_events = 0 if sessions == 0 else int(sessions * rng.integers(2, 9))
+        date = REFERENCE_DATE - (29 - t) days
+
+Collect into one big list -> DataFrame usage_daily. Expect ~ n_customers * 30
+rows (fine for SQLite; for the full dataset that could be large — if the CSV
+has > ~3000 rows, generate usage_daily ONLY for is_demo customers to keep the
+DB small, and let Step 2 compute its usage_trend feature directly from the
+flat columns instead of from usage_daily).
+
+
+-------------------------------------------------------------------------------
+PHASE 6 — SYNTHESIZE feedback  (0-3 rows per customer)
+-------------------------------------------------------------------------------
+Templated text (no LLM needed here — keep Step 1 offline & instant).
+
+Rules per customer:
+    n_support = min(support_contacts, 3)
+    for k in range(n_support):
+        channel = "support"
+        is_complaint = 1
+        sentiment = uniform(-0.9, -0.4)
+        text = choice(SUPPORT_TEMPLATES) formatted with plan_tier / topic
+               topics weighted by signals:
+                 payment_failures>0 -> "billing"/"payment declined"
+                 else               -> "playback issues"/"app crashes"/"content missing"
+    if payment_failures > 0 and rng.random() < 0.8:
+        add channel="support", topic="billing", sentiment ~ -0.7,
+            is_complaint=1
+    # NPS / review row for engaged-but-slipping or happy customers:
+    if rng.random() < 0.5:
+        channel = "nps" (or "review")
+        if bucket healthy:      sentiment ~ uniform(0.3, 0.9), is_complaint=0
+        elif bucket watch:      sentiment ~ uniform(-0.2, 0.4)
+        else:                   sentiment ~ uniform(-0.8, 0.0), is_complaint = (sentiment < -0.3)
+        text = choice(NPS_TEMPLATES) by sentiment sign
+    date = REFERENCE_DATE - rng.integers(1, 45) days
+
+SUPPORT_TEMPLATES (examples, write 6-8):
+    "Contacted support about {topic}; issue still not resolved after {days} days."
+    "Third time reporting {topic}. Considering cancelling my {plan} plan."
+    "Payment failed again and I was charged twice. Very frustrating."
+NPS_TEMPLATES positive:
+    "Great catalog, works well on all my devices."
+NPS_TEMPLATES negative:
+    "Used to love it, but I barely open the app now. Not sure it's worth {price}/mo."
+
+Customers with no support_contacts and healthy bucket may get 0 feedback rows —
+that's realistic and fine.
+
+
+-------------------------------------------------------------------------------
+PHASE 7 — WRITE TO SQLITE
+-------------------------------------------------------------------------------
+Use SQLAlchemy core or pandas.to_sql (simplest):
+
+    from sqlalchemy import create_engine
+    eng = create_engine(f"sqlite:///{DB}")
+
+    # idempotent: drop & recreate
+    with eng.begin() as cx:
+        for t in ["usage_daily","feedback","analyses","customers","meta"]:
+            cx.exec_driver_sql(f"DROP TABLE IF EXISTS {t}")
+
+    customers_df.to_sql("customers", eng, index=False)
+    usage_df.to_sql("usage_daily", eng, index=False)
+    feedback_df.to_sql("feedback", eng, index=False)
+
+    # analyses table: create empty with correct schema now so the app can
+    # INSERT later without a migration. Define via a tiny CREATE TABLE string
+    # (see OUTPUT CONTRACT for columns) — or let SQLAlchemy models in Step 8
+    # create it. Simplest: create it here with raw SQL.
+
+    meta = pd.DataFrame([
+        {"key":"built_at",        "value": datetime.utcnow().isoformat()},
+        {"key":"reference_date",  "value": str(REFERENCE_DATE)},
+        {"key":"n_customers",     "value": str(len(customers_df))},
+        {"key":"n_demo",          "value": str(int(customers_df.is_demo.sum()))},
+        {"key":"churn_rate",      "value": f"{customers_df.churn_label.mean():.3f}"},
+        {"key":"column_map",      "value": json.dumps(resolved_map)},
+        {"key":"seed",            "value": str(SEED)},
+    ])
+    meta.to_sql("meta", eng, index=False)
+
+Add indexes for the app's hot queries:
+    CREATE INDEX ix_usage_customer ON usage_daily(customer_id);
+    CREATE INDEX ix_feedback_customer ON feedback(customer_id);
+    CREATE INDEX ix_customers_demo ON customers(is_demo);
+
+
+-------------------------------------------------------------------------------
+PHASE 8 — VALIDATE  (--validate mode, prints a report, non-zero exit on fail)
+-------------------------------------------------------------------------------
+Checks:
+  [ ] customers row count == unique ext_id count
+  [ ] churn_label in {0,1} (or all NULL + warn "no label -> Step 2 will fail")
+  [ ] every customer has 0 or 30 usage_daily rows (30 for is_demo at minimum)
+  [ ] no usage_daily.active_minutes < 0 ; no NaN anywhere
+  [ ] feedback.sentiment within [-1, 1]
+  [ ] plan_tier distribution printed
+  [ ] churn rate printed (sanity: expect roughly 15-40% for this dataset)
+  [ ] renewal_date > reference_date for all rows
+  [ ] sample dump: 1 healthy + 1 critical customer with their usage trend
+      (first vs last 5-day mean) and feedback — eyeball that decline shows
+
+Print a "READY FOR STEP 2" banner if all pass.
+
+
+-------------------------------------------------------------------------------
+PHASE 9 — CLI SHAPE OF load_dataset.py
+-------------------------------------------------------------------------------
+    python load_dataset.py --inspect     # Phase 1 only, prints, no writes
+    python load_dataset.py               # full build (Phases 3-7)
+    python load_dataset.py --validate    # Phase 8 against existing DB
+    python load_dataset.py --rebuild     # drop DB file + full build
+
+Structure:
+    main()
+      parse args
+      load .env (DATASET_CSV, DEMO_SUBSET_SIZE, DATABASE_URL)
+      if --inspect: inspect(); return
+      df = pd.read_csv(RAW)
+      resolved = {k: resolve(df,k) for k in CANDIDATES}
+      customers = build_customers(df, resolved)
+      customers = mark_demo_subset(customers)
+      usage    = build_usage_daily(customers)
+      feedback = build_feedback(customers)
+      write_sqlite(customers, usage, feedback, resolved)
+      validate()               # always run at end of a build
+      print summary
+
+Keep ALL randomness seeded (np.random.default_rng(SEED) / +customer_id).
+Reruns must produce an identical DB.
+
+
+-------------------------------------------------------------------------------
+PHASE 10 — DELIVERABLES CHECKLIST FOR STEP 1
+-------------------------------------------------------------------------------
+  [ ] load_dataset.py written with the CLI above
+  [ ] data/customer_churn_raw.csv present (you provide)
+  [ ] `python load_dataset.py --inspect` output reviewed, CANDIDATES adjusted
+  [ ] `python load_dataset.py` runs clean, churn_agent.db created
+  [ ] `python load_dataset.py --validate` prints READY FOR STEP 2
+  [ ] DB spot-check in a SQLite viewer: customers / usage_daily / feedback /
+      meta populated, a critical customer visibly shows declining usage
+  [ ] column_map JSON saved in meta (documents what mapped to what)
+  [ ] commit load_dataset.py + customer_churn_raw.csv (public dataset) so the
+      Render deploy can rebuild the DB on boot
+
+NEXT: Step 2 — ml/train_model.py (reads customers table, engineers features,
+      trains XGBoost, writes churn_model.pkl + feature_columns.pkl)
+===============================================================================

@@ -1,0 +1,437 @@
+===============================================================================
+STEP 9 — FRONTEND SPA  (frontend/index.html)
+Churn Risk Agent  ·  detailed end-to-end implementation plan
+Aesthetic north star: Vitally / Stripe Dashboard / Linear — calm, dense,
+credible internal tool. NOT the generic "AI" look.
+===============================================================================
+
+GOAL
+----
+One self-contained file: frontend/index.html  (+ optional app.js / styles.css
+if the agent prefers 3 files — served as static by app/main.py from /).
+No build step, no framework. Vanilla JS + fetch. Tailwind via CDN ONLY as a
+utility layer with a CUSTOM theme config (see PART B) so it does not read as
+default-Tailwind. All product color/typography comes from our tokens.
+
+Two screens, hash-routed:
+  #/                     Dashboard  — account table, sorted by risk
+  #/customer/{id}        Customer 360 — signals, dual score, analyze/approve
+
+Design pillars (this is what wins the ranking):
+  1. PROFESSIONAL: neutral palette, one accent, semantic risk colors only,
+     hairline borders over shadows, tabular numbers, no gradients/glassmorphism.
+  2. EXPLAINABLE: every number has a "why" — contributor bars, tooltips,
+     "two methods" panel, playbook citation shown inline, ML drivers listed.
+  3. USER-FRIENDLY: obvious primary action per screen, keyboard shortcuts,
+     loading skeletons, empty/error states, nothing blocks on a slow LLM.
+
+
+-------------------------------------------------------------------------------
+PART A — HARD "DO NOT" LIST  (kills the AI-generated look)
+-------------------------------------------------------------------------------
+  - NO gradient backgrounds, NO backdrop-blur / glass, NO neon glow shadows.
+  - NO purple/violet accent. NO 3-color buttons.
+  - NO giant radial gauge. NO emoji in headings or buttons.
+  - NO huge border-radius (max 8px on cards, 6px on controls, 999px only on
+    pill badges).
+  - NO more than ONE subtle shadow token, used sparingly.
+  - NO center-aligned body text, NO hero section, NO marketing copy.
+  - Numbers ALWAYS right-aligned in tables and use tabular-nums.
+
+
+-------------------------------------------------------------------------------
+PART B — DESIGN TOKENS  (put in a <style> block; also feed to tailwind.config)
+-------------------------------------------------------------------------------
+:root {
+  /* surfaces */
+  --bg:        #ffffff;
+  --surface:   #f7f8fa;      /* page bg / panels */
+  --surface-2: #f0f2f5;      /* table header, hover */
+  --border:    #e4e7ec;      /* hairlines */
+  --border-2:  #d0d5dd;
+
+  /* text */
+  --text:      #101828;      /* primary */
+  --text-2:    #475467;      /* secondary */
+  --text-3:    #667085;      /* muted / captions */
+
+  /* accent (pick ONE — default: indigo-blue, professional not "AI purple") */
+  --accent:      #2563eb;
+  --accent-weak: #eff4ff;
+  --accent-text: #1d4ed8;
+
+  /* semantic risk (use ONLY for risk/priority, never decoration) */
+  --crit:   #d92d20;  --crit-bg:  #fef3f2;
+  --high:   #dc6803;  --high-bg:  #fffaeb;
+  --watch:  #eaaa08;  --watch-bg: #fefbe8;   /* optional mid tone */
+  --ok:     #099250;  --ok-bg:    #ecfdf3;
+  --neutral:#475467;  --neutral-bg:#f2f4f7;
+
+  /* type */
+  --font: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+          "Helvetica Neue", Arial, "Inter", sans-serif;
+  --fs-11: 11px; --fs-12: 12px; --fs-13: 13px; --fs-14: 14px;
+  --fs-16: 16px; --fs-20: 20px; --fs-24: 24px;
+
+  /* spacing scale */
+  --s-1:4px; --s-2:8px; --s-3:12px; --s-4:16px; --s-5:24px; --s-6:32px;
+
+  --radius:   8px;
+  --radius-sm:6px;
+  --shadow:   0 1px 2px rgba(16,24,40,.06), 0 1px 3px rgba(16,24,40,.04);
+}
+body { font: 400 var(--fs-14)/1.45 var(--font); color: var(--text);
+       background: var(--surface); -webkit-font-smoothing: antialiased; }
+.tabular { font-variant-numeric: tabular-nums; }
+
+Dark mode: OPTIONAL and only if time permits. If done, invert surfaces via a
+[data-theme="dark"] block; keep semantic risk hues, darken their -bg. Do NOT
+ship a half-done dark mode.
+
+Risk band -> color map (single source in JS):
+  critical -> --crit,  at_risk -> --high,  watch -> --watch,  healthy -> --ok
+Priority -> color map:
+  P0 -> --crit,  P1 -> --high,  P2 -> --neutral,  P3 -> --text-3
+
+
+-------------------------------------------------------------------------------
+PART C — LAYOUT / SHELL
+-------------------------------------------------------------------------------
+Top bar (56px, sticky, border-bottom, bg --bg):
+  left:  small square logo mark (SVG, monochrome) + "Churn Risk Agent"
+         (--fs-14, 600). Nothing else branded.
+  center: nothing (or a slim global search later — skip for demo).
+  right: "System healthy" dot (green) — click -> /api/health modal;
+         a "Demo" menu with the two known customers (3767 critical,
+         4837 low-risk) as quick links; keyboard hint "?".
+
+Main:  max-width 1200px, centered, padding 24px. Single column.
+  Dashboard = full-width table.
+  Customer 360 = two-column grid on >=1024px:
+     left  (7/12): identity + dual score + contributors + usage + feedback
+     right (5/12): the analysis card (recommendation + draft + approve)
+  On < 1024px: stack, analysis card first after the score.
+
+Footer: one line, --text-3, --fs-12: "Deterministic health score +
+XGBoost churn model + RAG-grounded LLM recommendation." (This sentence is
+the whole architecture story — keep it visible.)
+
+
+-------------------------------------------------------------------------------
+PART D — SCREEN 1: DASHBOARD  (#/)
+-------------------------------------------------------------------------------
+Data: GET /api/customers?demo_only=true  -> list[DashboardRow]
+
+D1. Header row of the screen:
+  H1 "Accounts" (--fs-20, 600) + count "· 40 accounts".
+  Right side: segmented control [ All | At risk | P0 only ] (client-side
+  filter). Default "All". A "Sort: Churn risk ▾" menu
+  (Churn risk / Health / ARR / Renewal date). Default Churn risk desc.
+
+D2. Summary strip (4 stat tiles, 1 row, thin, border, no shadow):
+  - "At risk" = count band in (critical, at_risk)     value in --crit
+  - "P0 escalations" = count escalate==true            value in --crit
+  - "Avg health" = mean health_score                    value in --text
+  - "ARR at risk" = sum(arr where band in crit/at_risk) value in --text
+  Each tile: label --fs-12 --text-3 uppercase tracking-wide; number --fs-24
+  600 tabular. Border --border, radius 8, padding 16. Hover: none.
+
+D3. Table (the centerpiece). Columns:
+  | Account        | Plan | Churn risk        | Health          | Priority | Top signal              | Renewal    |
+  - Account: name (600) + tiny id "#3767" (--text-3 --fs-12) below.
+  - Plan: pill (Basic/Standard/Premium), neutral style, --fs-12.
+  - Churn risk: NUMBER "99%" tabular, right-aligned + a 56px mini bar under
+      it (bar fill color = band color, track --surface-2). Sort key.
+  - Health: NUMBER "/100" + 56px bar (fill = band color inverted sense: high
+      health = green). Tooltip on hover: top 2 contributor labels.
+  - Priority: pill P0/P1/P2/P3 with priority color. P0 pill has a small dot.
+  - Top signal: single most-negative contributor label + its detail truncated
+      (title attr = full detail). e.g. "Recent inactivity · 60d since login".
+  - Renewal: relative "in 18d" (--crit if <=30, --high if <=60) or date.
+  Row: 52px height, border-bottom --border, hover bg --surface-2, cursor
+  pointer -> navigate #/customer/{id}. Focusable (tabindex=0, Enter = open).
+  Sticky thead, bg --surface-2, --fs-12 --text-2 600 uppercase.
+  Right-align all numeric columns. NO zebra (hairlines are enough).
+
+D4. States:
+  - Loading: 8 skeleton rows (shimmer via CSS @keyframes on a --surface-2
+      block, subtle, 1.4s). Stat tiles show "—".
+  - Error (fetch fails): inline banner --crit-bg, "Couldn't load accounts.
+      Retry" button. Console.error the detail.
+  - Empty (0 rows): centered --text-3 "No accounts match this filter."
+
+D5. Row click -> push hash #/customer/{id}; keep scroll position on back.
+
+
+-------------------------------------------------------------------------------
+PART E — SCREEN 2: CUSTOMER 360  (#/customer/{id})
+-------------------------------------------------------------------------------
+Data:
+  GET /api/customers/{id}  -> {customer, signals, usage_series,
+                               feedback_list, last_analysis}
+Load both the detail and render last_analysis if present. "Analyze" triggers
+POST and re-renders the analysis card.
+
+E0. Breadcrumb: "← Accounts" link (back to #/). Then, on the same line,
+    name (--fs-24 600) + id + plan pill + a band pill (colored).
+
+E1. IDENTITY CARD (left col, top):
+  Grid of small key/value pairs (label --fs-12 --text-3, value --fs-14 600):
+    Plan · ARR ($) · Tenure (e.g. "45 days") · Renewal ("in 18d") ·
+    Devices · Last login ("38 days ago") · Monthly charges.
+  Card: bg --bg, border --border, radius 8, padding 16-20. No shadow.
+
+E2. DUAL SCORE PANEL ("two methods, side by side" — the money shot):
+  Two equal columns inside one bordered card:
+   LEFT  "Churn probability — ML model"
+     big number "99%" (--fs-24 600, band color) + "XGBoost · v{model_version
+     short date}" caption. Under it a slim 8px bar (fill band color).
+     Small link "How? ▾" -> expands ML top_features list:
+        feature name · value · contribution bar (signed, diverging).
+   RIGHT "Health score — rule-based"
+     big number "39/100" (--fs-24 600, band color) + "{risk_band}" caption +
+     8px bar. Link "How? ▾" -> expands the contributor list (see E3).
+   BELOW both, full width: METHOD AGREEMENT strip.
+     if method_agreement.agree: subtle --ok-bg row "Both methods agree this
+        account is {band}."
+     else: --high-bg row "Rule-based and ML risk differ by
+        {gap}. Review signals below." (this candor reads as mature.)
+
+E3. CONTRIBUTOR BREAKDOWN (explainability core):
+  Title "Why — health score drivers".
+  For each contributor (already sorted most-negative first) render a row:
+     [label]                       [detail, --text-3 --fs-12]      [-18.0]
+     |------ diverging bar --------|
+  Diverging bar: center line at 0; negative impact draws LEFT in --crit,
+  positive (from positives[]) draws RIGHT in --ok. Bar max width scales to
+  the largest |impact| in the set. Show numeric impact right-aligned tabular.
+  Include positives[] at the bottom in green ("Long tenure +3").
+  Each row has title= full detail for hover. Keep to <= 8 rows.
+
+E4. USAGE TREND:
+  Small card. Header "Usage — last 30 days" + the trend figure
+  "▼ 61%" (--crit if <= -20%, --high if <0, --ok if >0) from
+  signals.usage_trend_pct.
+  Inline SVG sparkline from usage_series[].active_minutes:
+     ~ width 100%, height 48, single 1.5px stroke in --accent, faint area
+     fill (--accent at 8% alpha), last point a 3px dot. No axes, no grid.
+     Tooltip on hover: date + minutes (optional; skip if time-tight).
+  Under it: "Logins (30d): {logins_last_30} · Active days: {active_days_30}".
+
+E5. FEEDBACK:
+  Card "Recent feedback ({n})". List each feedback_list item:
+    channel pill (support/nps/review, neutral) · date --text-3 ·
+    sentiment chip: color by sign (--crit <0, --ok >0, --neutral ~0),
+    label e.g. "−0.70".
+    Then the text (--fs-13). is_complaint -> small "Complaint" tag --crit.
+  Empty -> "No feedback on record."
+
+E6. ANALYSIS CARD (right column — the action surface):
+  Two visual states:
+
+  (a) NO analysis yet (last_analysis == null):
+     Card with a short explainer "Run the agent to get a grounded retention
+     recommendation for this account." + big primary button
+     "Analyze account" (--accent bg, white, 40px, radius 6).
+     Caption under button: "Runs ML scoring, retrieves the matching playbook,
+     and drafts outreach. ~3-6s."
+
+  (b) HAS analysis (fresh or after Analyze):
+     Header: "Recommendation" + priority pill (P0..P3, colored) +
+        if escalate: a --crit-bg strip "P0 — escalate now" with a small
+        alert glyph (inline SVG, not emoji).
+     "Generated by" caption: map generated_by ->
+        gemini:*  -> "AI (Gemini) · grounded in playbook + signals"
+        fallback  -> "Template (LLM unavailable)"
+        low_risk_shortcut -> "Rule-based · low risk, LLM skipped"
+     SUMMARY: the summary text (--fs-14). If it contains "per playbook" /
+        "Per playbook", render the playbook title as a subtle inline
+        chip/link that scrolls to the playbook box (E7).
+     TOP REASONS: bulleted list (custom dash bullet, --text-2), max 3.
+     RECOMMENDED ACTION: label in 600 + the elaborated text under it.
+     DRAFT MESSAGE: a bordered <textarea> (min 8 rows, --fs-13, mono-ish
+        line-height), prefilled with draft_message, editable.
+        Above it a row: "Draft outreach" label + char count.
+     APPROVE BAR (sticky bottom of card):
+        [ Approve ]  primary (--ok bg white text)
+        [ Save edit ] secondary (border) — enabled only if textarea changed
+        [ Dismiss ]  ghost (--text-3), confirm via a small inline
+                     "Dismiss this recommendation? [Yes] [No]"
+        Each -> POST /api/customers/{id}/approve
+           Approve  -> {status:"approved", message:<textarea current>}
+           Save edit-> {status:"edited",   message:<textarea current>}
+           Dismiss  -> {status:"dismissed", message:""}
+        On success: toast "Saved" + update a status line
+           "Status: approved · just now" and disable the bar (re-enable on
+           further edit). Re-fetch detail to sync.
+     RE-ANALYZE: a small ghost link top-right "Re-run" -> same POST analyze,
+        replaces card content (confirm if current status != new).
+
+E7. PLAYBOOK BOX (below analysis card or in left col bottom):
+  "Retrieved playbook" — playbook.title (600) + method chip
+  ("semantic match 0.73" if method=="embedding" else "keyword match") +
+  low_confidence -> --high tag "low confidence".
+  Then playbook.text in a --surface panel, --fs-13, italic-free.
+  Caption: "Selected by cosine similarity over the retention playbook corpus."
+
+E8. States:
+  - detail loading: skeleton for identity + score + a spinner in analysis card
+  - Analyze in-flight: button -> disabled, label "Analyzing…", a determinate-
+    looking 3-step ticker under it:
+       "Scoring signals" -> "Retrieving playbook" -> "Drafting outreach"
+       (advance on a timer ~1.2s each; purely cosmetic but reads well and
+        matches the real pipeline stages). Cap at step 3 until response.
+  - Analyze error: inline --crit-bg "Analysis failed. Retry." (should be rare
+    — orchestrator degrades server-side; this is for network only).
+  - approve error: toast --crit "Couldn't save. Retry."
+
+
+-------------------------------------------------------------------------------
+PART F — JS ARCHITECTURE  (keep it small, ~400-600 lines)
+-------------------------------------------------------------------------------
+No framework. Structure:
+
+  const API = (location.origin) ;           // same-origin; endpoints /api/*
+  async function api(path, opts) {
+     const r = await fetch(API + path, {headers:{'Content-Type':'application/json',
+        ...authHeader()}, ...opts});
+     if (!r.ok) throw new ApiError(r.status, await r.text());
+     return r.json();
+  }
+  function authHeader(){ /* if window.__BASIC__ set -> Authorization: Basic ..
+     ; for now returns {} because AUTH_DISABLED=1 */ }
+
+  // tiny render helpers
+  el(tag, attrs, ...children)                // hyperscript-ish
+  fmtPct(x) fmtMoney(x) fmtDays(n) relDate(iso) bandColor(b) prioColor(p)
+
+  // router
+  window.addEventListener('hashchange', route);
+  function route(){
+     const h = location.hash || '#/';
+     if (h.startsWith('#/customer/')) renderCustomer(+h.split('/')[2]);
+     else renderDashboard();
+  }
+
+  // views
+  renderDashboard():  api('/api/customers?demo_only=true') -> build table,
+     wire filters/sort client-side, cache in memory for back-nav.
+  renderCustomer(id): api(`/api/customers/${id}`) -> build 360; wire
+     Analyze -> api(`/api/customers/${id}/analyze`, {method:'POST', body:'{}'})
+     approve -> api(`/api/customers/${id}/approve`, {method:'POST',
+                 body: JSON.stringify({status, message})}).
+
+  // components
+  sparkline(points, opts) -> returns <svg> string/node
+  divergingBar(value, maxAbs) -> node
+  scoreBar(pct, color) -> node
+  pill(text, color) toast(msg, kind) skeleton(n)
+
+State: module-scoped objects  { dashboard: rows|null, current: detail|null }.
+No global framework state; re-render the whole view on nav (cheap at this
+scale). Keep the textarea's edited value in a local var so re-render of
+sibling parts doesn't clobber it (or just don't re-render the analysis card
+while editing).
+
+Accessibility:
+  - table rows: role="button" tabindex="0", Enter/Space activate.
+  - all interactive controls are real <button>/<a>, focus-visible outline
+    (2px --accent).
+  - color is never the ONLY signal: pills have text (P0, "Critical"),
+    bars have numbers.
+  - textarea has a <label>. Toasts use aria-live="polite".
+  - prefers-reduced-motion -> disable shimmer + the analyze ticker animation.
+
+Keyboard shortcuts (nice for the demo, cheap):
+  "/" focus filter (dashboard) ; "j/k" move row selection ; Enter open ;
+  "a" on 360 = Analyze ; "esc" = back to dashboard ; "?" = shortcuts modal.
+
+
+-------------------------------------------------------------------------------
+PART G — SERVING / WIRING
+-------------------------------------------------------------------------------
+  - File lives at frontend/index.html (app/main.py already mounts
+    StaticFiles(directory="frontend", html=True) at "/").
+  - Same-origin fetch: no CORS needed in prod. In dev if you open the file
+    directly (file://) it WON'T work — always load via
+    http://localhost:8000/ so /api/* is same-origin.
+  - Tailwind CDN <script src="https://cdn.tailwindcss.com"></script> then
+    tailwind.config = { theme: { extend: { colors: {...our tokens...},
+    fontFamily: { sans: [...] }, borderRadius:{DEFAULT:'8px'} } } }.
+    NOTE: CDN Tailwind is fine for a hackathon/demo. If the Render CSP or
+    reviewers dislike CDN, inline a ~4kb hand-written utility CSS instead —
+    the token block in PART B covers 90% of it. Decide early; don't mix.
+  - Favicon: a 1-color SVG data-URI (simple shield or spark). No external.
+  - Put a <noscript> line: "This dashboard requires JavaScript."
+
+
+-------------------------------------------------------------------------------
+PART H — MANUAL QA CHECKLIST  (do before declaring Step 9 done)
+-------------------------------------------------------------------------------
+Run: uvicorn app.main:app --port 8000 ; open http://localhost:8000/
+  [ ] Dashboard loads, 40 rows, critical (#3767) near top, P0 pill visible
+  [ ] Stat tiles compute (at-risk count, P0 count, avg health, ARR at risk)
+  [ ] Sort by Health / ARR / Renewal works; "P0 only" filter works
+  [ ] Row hover + click -> #/customer/3767 ; browser Back returns to list
+  [ ] 360 loads: identity grid correct, dual score shows 99% vs low health,
+      both bands colored consistently, method-agreement strip renders
+  [ ] "How?" expanders show ML top_features and contributor diverging bars
+  [ ] Usage sparkline draws from 30 points, trend figure sign/color right
+  [ ] Feedback list renders with sentiment chips; complaint tag shows
+  [ ] Analyze (live): button -> ticker -> card fills; priority P0, escalate
+      strip, summary cites playbook title as a chip, draft in textarea
+  [ ] Edit textarea -> "Save edit" enables -> POST -> toast + status line
+  [ ] Approve -> status "approved · just now", bar disables
+  [ ] Dismiss -> inline confirm -> status "dismissed"
+  [ ] Re-run -> confirm prompt (status != new) -> refreshes
+  [ ] Visit #/customer/4837 -> Analyze -> "Rule-based · low risk, LLM
+      skipped", no draft message, no playbook box (or empty state)
+  [ ] LLM disabled server-side (LLM_DISABLE=1) -> analyze still fills card,
+      "Generated by: Template (LLM unavailable)" — UI unchanged otherwise
+  [ ] Kill the server mid-load -> dashboard shows error banner + Retry
+  [ ] Narrow window to ~700px -> columns stack, analysis card first,
+      table scrolls horizontally inside its container (no page x-scroll)
+  [ ] Tab through: focus rings visible, Enter opens a row, "a" analyzes
+  [ ] Lighthouse/DevTools: no console errors, no layout shift on load
+  [ ] View in Chrome + one more browser (Edge/Firefox)
+
+
+-------------------------------------------------------------------------------
+PART I — DELIVERABLES CHECKLIST FOR STEP 9
+-------------------------------------------------------------------------------
+  [ ] frontend/index.html  (single file; or index.html + app.js + styles.css)
+        - token <style> block from PART B
+        - shell (top bar, footer), hash router
+        - Dashboard: stat strip + sortable/filterable table + states
+        - Customer 360: identity, DUAL SCORE panel, contributor diverging
+          bars, ML "how?" drivers, usage sparkline, feedback, analysis card
+          with analyze ticker + editable draft + approve/edit/dismiss bar +
+          playbook box + method-agreement strip
+        - components: sparkline(), divergingBar(), scoreBar(), pill(),
+          toast(), skeleton()
+        - a11y: real buttons, focus-visible, aria-live toasts,
+          prefers-reduced-motion, color+text redundancy
+        - keyboard shortcuts (/ j k Enter a esc ?)
+  [ ] favicon as inline SVG data-URI
+  [ ] app/main.py StaticFiles mount confirmed serving it at /
+  [ ] manual QA checklist (PART H) all ticked
+  [ ] screenshots captured: dashboard, 360 with P0 analysis, 360 low-risk
+      -> for the LinkedIn post (Step 12) and slides
+  [ ] commit frontend/ + any main.py tweak
+
+(this is the ranking-visible surface — invest here)
+  ~30m shell+tokens+router, ~45m dashboard, ~60-75m customer 360 +
+  analysis card, ~20m states/a11y/keyboard, ~20m QA + screenshots.
+
+WATCH-OUTS
+  - Load via http://localhost:8000/ , never file:// (breaks /api).
+  - Do not re-render the analysis card while the user is editing the draft.
+  - Keep the "two methods" panel prominent — it's the intellectual hook.
+  - Every colored thing also has a text label / number. No color-only meaning.
+  - Resist scope creep: no global search, no charts library, no auth UI
+    (Step 11), no pagination (40 rows). Polish the core flow instead.
+  - If Tailwind CDN feels risky for the deploy, switch to the inline utility
+    CSS EARLY, not the night before.
+NEXT: Step 10 — end-to-end test pass + 3-minute demo script (customers 3767
+      and 4837), then Step 11 (auth + Render), Step 12 (LinkedIn).
+===============================================================================

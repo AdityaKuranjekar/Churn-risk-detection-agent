@@ -1,0 +1,438 @@
+===============================================================================
+STEP 7 — ORCHESTRATOR  (the pipeline that replaces n8n)
+Files:  app/services/orchestrator.py
+        app/services/signals.py        (get_signals + aggregations)
+        app/db.py                      (engine/session — create if not present)
+        app/models.py                  (SQLAlchemy models incl. Analysis)
+        tests/test_orchestrator.py
+Churn Risk Agent  ·  detailed end-to-end implementation plan
+===============================================================================
+
+GOAL
+----
+One function the API calls:  analyze_customer(customer_id) -> dict
+It sequences the services built in Steps 2-6 and persists the result.
+
+  get_signals(customer_id)      DB row + usage_daily/feedback aggregates -> signals
+  analyze_customer(customer_id) ml -> scoring -> action -> [low-risk shortcut]
+                                -> rag -> llm -> assemble -> save -> return
+  save_analysis(customer_id, result)   upsert into `analyses`
+  get_last_analysis(customer_id)       read back for GET endpoints
+
+DESIGN PRINCIPLES
+  - THIN. Pure sequencing + assembly + persistence. Zero business logic here
+    (no scoring math, no action rules, no prompt text). If you're tempted to
+    compute something, it belongs in a service.
+  - Deterministic given the DB state + (LLM variance aside).
+  - Every external call wrapped so one failure degrades gracefully instead of
+    500-ing the endpoint. Always return a well-formed result dict.
+  - Demo narration: "this file IS the n8n workflow, as readable Python."
+
+
+-------------------------------------------------------------------------------
+PART A — app/db.py + app/models.py  (persistence foundation)
+-------------------------------------------------------------------------------
+If Step 1 already created SQLAlchemy models, REUSE them. If Step 1 wrote tables
+via pandas.to_sql only (no ORM), add a minimal ORM layer now.
+
+A1. app/db.py
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker, DeclarativeBase
+    import os
+    DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./churn_agent.db")
+    engine = create_engine(DATABASE_URL, connect_args=
+        {"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {})
+    SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+    class Base(DeclarativeBase): pass
+    def get_session():           # FastAPI dependency later
+        s = SessionLocal()
+        try: yield s
+        finally: s.close()
+
+A2. app/models.py  — reflect existing tables OR declare them.
+    Minimum needed by the orchestrator:
+
+    class Customer(Base):
+        __tablename__ = "customers"
+        id = mapped_column(Integer, primary_key=True)
+        # ... all columns from Step 1 OUTPUT CONTRACT ...
+        # (map only what you read; extend as needed)
+
+    class UsageDaily(Base):
+        __tablename__ = "usage_daily"
+        id, customer_id, date, active_minutes, logins, sessions, feature_events
+
+    class Feedback(Base):
+        __tablename__ = "feedback"
+        id, customer_id, date, channel, text, sentiment, is_complaint
+
+    class Analysis(Base):
+        __tablename__ = "analyses"
+        id            = mapped_column(Integer, primary_key=True)
+        customer_id   = mapped_column(Integer, index=True)
+        created_at    = mapped_column(DateTime, default=datetime.utcnow)
+        churn_probability = mapped_column(Float)
+        health_score      = mapped_column(Integer)
+        risk_band         = mapped_column(String)
+        priority          = mapped_column(String)
+        recommended_action= mapped_column(String)
+        escalate          = mapped_column(Boolean, default=False)
+        playbook_id       = mapped_column(String, nullable=True)
+        generated_by      = mapped_column(String)          # gemini:* | fallback | low_risk_shortcut
+        result_json       = mapped_column(Text)            # full assembled dict
+        status            = mapped_column(String, default="new")
+                            # new | approved | edited | dismissed
+        approved_message  = mapped_column(Text, nullable=True)
+        approved_at       = mapped_column(DateTime, nullable=True)
+
+    IMPORTANT: Step 1 created `analyses` as an empty table already (per its
+    Phase 7). If the columns differ, either ALTER via a tiny migration script
+    or DROP+CREATE `analyses` here (it holds no real data yet). Keep one
+    schema definition — this one.
+
+A3. create_all guard (called from main.py Step 8, but define here):
+    def init_db(): Base.metadata.create_all(engine)
+
+
+-------------------------------------------------------------------------------
+PART B — app/services/signals.py  (get_signals + aggregations)
+-------------------------------------------------------------------------------
+This is the ONLY place that reads usage_daily / feedback. Pure read + math.
+
+B0. CONSTANTS
+    REFERENCE_DATE   = read from meta table key "reference_date"
+                       (fallback: date.today())  -> so "days since" math matches
+                       Step 1's synthesis frame.
+    TREND_RECENT_DAYS   = 7
+    TREND_BASELINE_DAYS = 30
+    FEEDBACK_WINDOW_DAYS = 90
+
+B1. get_signals(session, customer_id) -> dict
+    c = session.get(Customer, customer_id)
+    if c is None: raise CustomerNotFound(customer_id)
+
+    # --- usage aggregates ---
+    rows = session.query(UsageDaily).filter_by(customer_id=customer_id)\
+                  .order_by(UsageDaily.date).all()
+    usage_trend_pct = _trend(rows)          # (recent7 mean - prior mean)/prior
+    logins_last_30  = sum(r.logins for r in rows[-30:])
+    active_days_30  = sum(1 for r in rows[-30:] if (r.active_minutes or 0) > 0)
+    usage_level     = c.usage_level if c.usage_level is not None \
+                      else _sum_recent(rows, 30)
+
+    # --- feedback aggregates (last 90d vs REFERENCE_DATE) ---
+    fb = session.query(Feedback).filter_by(customer_id=customer_id).all()
+    fb90 = [f for f in fb if _within(f.date, FEEDBACK_WINDOW_DAYS)]
+    avg_sentiment  = mean([f.sentiment for f in fb90]) if fb90 else None
+    complaint_count= sum(1 for f in fb90 if f.is_complaint)
+    open_tickets   = sum(1 for f in fb90 if f.channel == "support"
+                         and f.is_complaint)          # proxy; Step1 has no
+                                                      # explicit open flag
+    last_feedback_sentiment = fb90[-1].sentiment if fb90 else None
+
+    # --- renewal / tenure ---
+    days_to_renewal = _days_between(REFERENCE_DATE, c.renewal_date)
+
+    return {
+      "customer_id": c.id, "name": c.name, "plan_tier": c.plan_tier,
+      "plan_tier_ord": c.plan_tier_ord, "tenure_days": c.tenure_days,
+      "arr": c.arr, "monthly_charges": c.monthly_charges,
+      "renewal_date": str(c.renewal_date), "days_to_renewal": days_to_renewal,
+      "num_devices": c.num_devices, "age": c.age,
+      "usage_level": usage_level, "usage_trend_pct": usage_trend_pct,
+      "last_login_days": c.last_login_days,
+      "logins_last_30": logins_last_30, "active_days_last_30": active_days_30,
+      "payment_failures": c.payment_failures,
+      "support_contacts": c.support_contacts, "open_tickets": open_tickets,
+      "complaint_count": complaint_count,
+      "avg_sentiment": avg_sentiment,
+      "last_feedback_sentiment": last_feedback_sentiment,
+      "engagement_score": c.engagement_score,
+      # convenience for UI / detail endpoint (not scored):
+      "usage_series": [{"date": str(r.date),
+                        "active_minutes": r.active_minutes} for r in rows],
+      "feedback_list": [{"date": str(f.date), "channel": f.channel,
+                         "text": f.text, "sentiment": f.sentiment,
+                         "is_complaint": bool(f.is_complaint)} for f in fb],
+    }
+
+B2. HELPERS
+    _trend(rows): if <14 rows -> 0.0. recent = mean active_minutes of last
+        TREND_RECENT_DAYS; base = mean of the TREND_BASELINE_DAYS before that.
+        return 0.0 if base <= 0 else (recent - base)/base  (clip [-1, 3])
+    _within(d, days): REFERENCE_DATE - parse(d) <= days
+    _days_between(ref, target): (parse(target) - ref).days   (can be negative)
+
+B3. get_signals_by_id(customer_id): opens its own session (for API list use).
+
+
+-------------------------------------------------------------------------------
+PART C — app/services/orchestrator.py  (the pipeline)
+-------------------------------------------------------------------------------
+
+C0. IMPORTS
+    from app.db import SessionLocal
+    from app.models import Analysis
+    from app.services import signals as signals_mod
+    from app.services import scoring, action_catalog, rag, llm
+    from app.services import ml_model
+    import os, json, logging, datetime
+    CHURN_THRESHOLD = float(os.getenv("CHURN_THRESHOLD", "0.50"))
+
+C1. analyze_customer(customer_id: int, force: bool = False) -> dict
+    """
+    force=False: if a fresh analysis exists (< N min old) return it (cheap).
+    force=True (default from the API 'Analyze' button): always recompute.
+    """
+    with SessionLocal() as session:
+        sig = signals_mod.get_signals(session, customer_id)   # raises if 404
+
+        # 1. ML probability (never throws — ml_model clamps / medians)
+        try:
+            ml = ml_model.predict_from_customer(_ml_row(sig))
+        except Exception as e:
+            logging.exception("ml failed")
+            ml = {"churn_probability": _fallback_prob(sig), "band": "unknown",
+                  "top_features": [], "model_version": "unavailable"}
+        churn_prob = float(ml["churn_probability"])
+        sig["ml_top_features"] = ml["top_features"]
+
+        # 2. deterministic breakdown (pure, never throws)
+        breakdown = scoring.risk_breakdown(sig)
+
+        # 3. base action (pure, never throws)
+        base_action = action_catalog.pick_base_action(sig, churn_prob)
+
+        # 4. branch
+        if churn_prob < CHURN_THRESHOLD and breakdown["risk_band"] in
+                ("healthy", "watch") and not force_llm_override(sig):
+            result = _low_risk_result(sig, ml, breakdown, base_action)
+        else:
+            # 5. RAG (falls back to lexical internally; never throws)
+            try:
+                query   = rag.build_query(sig, base_action)
+                snippet = rag.retrieve_best(query)
+            except Exception as e:
+                logging.exception("rag failed")
+                snippet = _empty_snippet()
+            # 6. LLM (returns fallback dict on any failure; never throws)
+            llm_out = llm.analyze(sig, churn_prob, breakdown, snippet, base_action)
+            result  = _assemble(sig, ml, breakdown, base_action, snippet, llm_out)
+
+        # 7. persist
+        row = _save(session, customer_id, result)
+        result["analysis_id"] = row.id
+        result["created_at"]  = row.created_at.isoformat()
+        return result
+
+C2. _assemble(sig, ml, breakdown, base_action, snippet, llm_out) -> dict
+    return {
+      # the 7 LLM-contract keys (from llm_out, already coerced):
+      "summary": llm_out["summary"],
+      "top_reasons": llm_out["top_reasons"],
+      "recommended_action": llm_out["recommended_action"],
+      "priority": llm_out["priority"],
+      "draft_message": llm_out["draft_message"],
+      "playbook_citation": llm_out.get("playbook_citation", ""),
+      "generated_by": llm_out.get("_generated_by", "unknown"),
+      # structured context for the UI:
+      "customer": {"id": sig["customer_id"], "name": sig["name"],
+                   "plan_tier": sig["plan_tier"], "arr": sig["arr"],
+                   "renewal_date": sig["renewal_date"],
+                   "days_to_renewal": sig["days_to_renewal"]},
+      "ml": {"churn_probability": round(float(ml["churn_probability"]), 4),
+             "band": ml["band"], "top_features": ml["top_features"],
+             "model_version": ml["model_version"]},
+      "risk_breakdown": breakdown,          # health_score, contributors, ...
+      "base_action": base_action,           # action, priority, channel, rule
+      "playbook": {"id": snippet.get("id"), "title": snippet.get("title"),
+                   "text": snippet.get("text"), "score": snippet.get("score"),
+                   "method": snippet.get("retrieval_method"),
+                   "low_confidence": snippet.get("low_confidence")},
+      "escalate": base_action["priority"] == "P0",
+      "method_agreement": scoring.agreement(breakdown["health_score"],
+                                            float(ml["churn_probability"])),
+      "signals_snapshot": {k: sig[k] for k in (
+          "usage_trend_pct","last_login_days","logins_last_30",
+          "payment_failures","support_contacts","open_tickets",
+          "complaint_count","avg_sentiment","engagement_score")},
+      "status": "new",
+    }
+
+C3. _low_risk_result(sig, ml, breakdown, base_action) -> dict
+    Same shape as _assemble, but:
+      summary = f"{sig['name']} ({sig['plan_tier']}) is {breakdown['risk_band']}"
+                f" - health {breakdown['health_score']}/100, ML churn "
+                f"{float(ml['churn_probability']):.0%}. Routine monitoring."
+      top_reasons = [p["label"]+": "+p["detail"]
+                     for p in breakdown.get("positives", [])][:3] or \
+                    ["No significant risk signals detected."]
+      recommended_action = base_action["action_label"]   # usually "monitor"
+      priority = base_action["priority"]                  # usually P3
+      draft_message = ""
+      playbook_citation = ""
+      generated_by = "low_risk_shortcut"
+      playbook = _empty_snippet()
+      escalate = False
+    -> NO rag call, NO llm call. This is the cost/latency saver + the
+       "we don't spam healthy accounts" story.
+
+C4. _ml_row(sig) -> dict
+    Map signals keys -> the flat keys ml_model.build_feature_dict expects.
+    (They mostly match; be explicit so a signals rename can't silently break
+    inference.)  Assert it covers ml.features.BASE_COLS.
+
+C5. _save(session, customer_id, result) -> Analysis
+    row = Analysis(
+      customer_id=customer_id,
+      churn_probability=result["ml"]["churn_probability"],
+      health_score=result["risk_breakdown"]["health_score"],
+      risk_band=result["risk_breakdown"]["risk_band"],
+      priority=result["priority"],
+      recommended_action=result["recommended_action"],
+      escalate=result["escalate"],
+      playbook_id=result["playbook"].get("id"),
+      generated_by=result["generated_by"],
+      result_json=json.dumps(result, default=str),
+      status="new",
+    )
+    session.add(row); session.commit(); session.refresh(row)
+    return row
+    # keep ALL prior analyses (history). "last" = max(created_at).
+
+C6. get_last_analysis(customer_id) -> dict | None
+    row = session.query(Analysis).filter_by(customer_id=customer_id)\
+          .order_by(Analysis.created_at.desc()).first()
+    return json.loads(row.result_json) | {"analysis_id": row.id,
+        "created_at": row.created_at.isoformat(), "status": row.status} if row
+        else None
+
+C7. approve_analysis(analysis_id, message, status) -> dict
+    (called by POST /approve in Step 8; put the DB write here to keep the
+     router thin)
+    row = session.get(Analysis, analysis_id)
+    row.status = status                      # approved | edited | dismissed
+    row.approved_message = message
+    row.approved_at = datetime.utcnow()
+    session.commit()
+    return {"analysis_id": row.id, "status": row.status,
+            "approved_message": row.approved_message}
+
+C8. list_dashboard_rows(demo_only=True) -> list[dict]
+    For GET /customers. For each customer (filter is_demo=1 by default):
+      - try get_last_analysis(); if present + fresh -> use its churn_prob /
+        health / band / priority / top reason
+      - else: compute a CHEAP preview (ml_model.predict_from_customer +
+        scoring.risk_breakdown, NO rag/llm) and DO NOT persist
+      Return sorted by churn_probability desc (or health asc).
+    Keep this fast: 40 rows * (1 model predict + pure scoring) = instant.
+
+
+-------------------------------------------------------------------------------
+PART D — ERROR / EDGE HANDLING
+-------------------------------------------------------------------------------
+  CustomerNotFound            -> raised by get_signals; API maps to 404
+  ml_model.ModelNotLoaded     -> let it crash at import (fail fast); if you
+                                 want soft-fail, catch in main.py lifespan
+  rag EmbeddingUnavailable    -> handled inside rag (lexical fallback)
+  llm any error               -> handled inside llm (_fallback dict)
+  DB commit failure           -> log, still return the computed result with
+                                 result["persisted"] = False (don't 500 the
+                                 analyze click over a write hiccup)
+  empty usage_daily/feedback  -> _trend returns 0.0, aggregates return
+                                 None/0; scoring + llm both tolerate this
+  force flag                  -> API 'Analyze' button always passes force=True
+
+
+-------------------------------------------------------------------------------
+PART E — tests/test_orchestrator.py
+-------------------------------------------------------------------------------
+Use the REAL churn_agent.db (read-only for signals) but a TEMP analyses table
+or a transaction rollback so tests don't pollute history. Simplest: point
+DATABASE_URL at a copy, or wrap each test in a session that rolls back.
+
+  [ ] get_signals(known_id) returns all documented keys; types correct;
+      usage_series non-empty for a demo customer
+  [ ] get_signals(999999) raises CustomerNotFound
+  [ ] _trend: synthetic declining rows -> negative; flat rows -> ~0;
+      <14 rows -> exactly 0.0
+  [ ] analyze_customer(critical_id, force=True):
+        - result has all 7 LLM keys + ml + risk_breakdown + base_action
+          + playbook + escalate + method_agreement
+        - priority == base_action["priority"]
+        - escalate == (priority == "P0")
+        - a row was written to analyses; get_last_analysis returns it
+  [ ] analyze_customer(healthy_id): generated_by == "low_risk_shortcut",
+        no playbook.id, draft_message == "", NO llm call
+        (assert via monkeypatch: llm.analyze raises if called)
+  [ ] LLM disabled (LLM_DISABLE=1): high-risk path still completes,
+        generated_by == "fallback", result well-formed
+  [ ] rag monkeypatched to raise -> analyze_customer still returns, playbook
+        fields are the empty snippet, no exception
+  [ ] ml_model monkeypatched to raise -> churn_prob uses _fallback_prob,
+        pipeline completes
+  [ ] approve_analysis(id, "edited msg", "approved") -> status persisted
+  [ ] list_dashboard_rows() returns <= DEMO_SUBSET_SIZE rows, sorted by
+        churn_probability desc, each with health_score + priority
+  [ ] determinism: two analyze_customer(id, force=True) with LLM_DISABLE=1
+        produce identical churn_probability + health_score + priority
+        (LLM text may vary when enabled — don't assert on it)
+
+
+-------------------------------------------------------------------------------
+PART F — INTEGRATION NOTES (Step 8 API)
+-------------------------------------------------------------------------------
+  POST /customers/{id}/analyze
+      -> orchestrator.analyze_customer(id, force=True)  -> 200 result JSON
+      -> CustomerNotFound -> 404
+  GET  /customers/{id}
+      -> {customer detail from get_signals} + get_last_analysis(id)
+  GET  /customers
+      -> orchestrator.list_dashboard_rows(demo_only=True)
+  POST /customers/{id}/approve   (body: {analysis_id?, message, status})
+      -> orchestrator.approve_analysis(...)
+  main.py lifespan: app.db.init_db(); rag.warm(); log ml_model.health()
+  Wrap routers with the Basic Auth dependency (Step 11).
+
+
+-------------------------------------------------------------------------------
+PART G — DELIVERABLES CHECKLIST FOR STEP 7
+-------------------------------------------------------------------------------
+  [ ] app/db.py (engine, SessionLocal, Base, get_session, init_db)
+  [ ] app/models.py (Customer, UsageDaily, Feedback, Analysis) — ONE schema
+      for `analyses`; reconcile with Step 1's empty table (drop+recreate ok)
+  [ ] app/services/signals.py (get_signals, _trend, window helpers,
+      REFERENCE_DATE from meta)
+  [ ] app/services/orchestrator.py (analyze_customer, _assemble,
+      _low_risk_result, _save, get_last_analysis, approve_analysis,
+      list_dashboard_rows) — THIN, no business logic
+  [ ] tests/test_orchestrator.py green (branching, persistence, degradation,
+      determinism)
+  [ ] manual end-to-end (offline):
+      LLM_DISABLE=1 py -c "from app.services.orchestrator import
+        analyze_customer; import json;
+        print(json.dumps(analyze_customer(<critical_id>, force=True),
+        indent=2, default=str))"
+      -> full result, generated_by 'fallback', row in analyses
+  [ ] manual end-to-end (live): same without LLM_DISABLE -> generated_by
+      'gemini:gemini-2.5-flash', summary cites playbook, priority preserved
+  [ ] pick real customer_ids from churn_agent.db first:
+      one P0/critical, one healthy — note them for the demo script
+  [ ] commit app/db.py app/models.py app/services/{signals,orchestrator}.py
+      + tests
+
+
+WATCH-OUTS
+  - Keep orchestrator THIN. No scoring math, no rules, no prompt strings.
+  - REFERENCE_DATE must come from meta so "days since" lines up with Step 1's
+    synthetic frame — otherwise renewal / recency math is off.
+  - `analyses` schema: don't end up with two definitions. Step 1 made an empty
+    one; this step owns the final shape. Drop+recreate is fine (no data lost).
+  - Low-risk shortcut MUST NOT call rag or llm — assert it in tests.
+  - Every service call is wrapped; analyze_customer must NEVER raise except
+    CustomerNotFound. A degraded result beats a 500 mid-demo.
+  - Persist the FULL result_json; the API replays it verbatim (no recompute
+    on GET).
+NEXT: Step 8 — app/main.py + app/routers/ (FastAPI: customers list/detail,
+      analyze, approve) + app/schemas.py.
+===============================================================================

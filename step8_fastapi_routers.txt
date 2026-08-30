@@ -1,0 +1,419 @@
+===============================================================================
+STEP 8 — FASTAPI APP + ROUTERS
+Files:  app/main.py
+        app/schemas.py
+        app/routers/__init__.py
+        app/routers/customers.py
+        app/routers/analysis.py
+        app/routers/health.py           (optional but handy)
+        app/deps.py                     (auth stub + shared deps)
+        tests/test_api.py
+Churn Risk Agent  ·  detailed end-to-end implementation plan
+===============================================================================
+
+GOAL
+----
+Expose the orchestrator over HTTP with a tiny, stable REST surface the SPA
+(Step 9) consumes. No business logic in routers — they call orchestrator /
+signals functions and shape responses.
+
+  GET  /api/customers                 dashboard list (sorted by risk)
+  GET  /api/customers/{id}            full detail + last analysis
+  POST /api/customers/{id}/analyze    run pipeline, store, return result
+  POST /api/customers/{id}/approve    save CSM decision on an analysis
+  GET  /api/health                    liveness + component status
+  (GET /api/meta                      demo ids, reference_date, counts — opt.)
+
+DESIGN PRINCIPLES
+  - Routers are THIN: validate input -> call a service -> return a schema.
+  - All paths under /api so the SPA can be served from / by the same app.
+  - Consistent errors: {"detail": "..."} with correct status codes.
+  - Every route takes the auth dependency NOW (stub returns True); Step 11
+    swaps the stub body for real HTTP Basic. No route wiring changes later.
+  - CORS open in dev, locked to same-origin in prod (env-driven).
+  - Pydantic v2. FastAPI lifespan (not deprecated on_event).
+
+
+-------------------------------------------------------------------------------
+PART A — app/deps.py  (shared dependencies)
+-------------------------------------------------------------------------------
+    import os
+    from fastapi import Depends, HTTPException, status
+    from app.db import SessionLocal
+
+    def get_db():
+        db = SessionLocal()
+        try: yield db
+        finally: db.close()
+
+    # --- AUTH STUB (Step 11 fills this in) ---
+    # Keep the signature stable. Today: no-op. Later: HTTP Basic check.
+    def require_auth() -> str:            # returns username
+        if os.getenv("AUTH_DISABLED", "1") == "1":
+            return "dev"
+        # Step 11 replaces below with secrets.compare_digest on
+        # APP_USERNAME / APP_PASSWORD via HTTPBasic.
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED)
+
+    NOTE: attach as router-level dependency so it covers every route:
+        APIRouter(prefix="/api", dependencies=[Depends(require_auth)])
+
+
+-------------------------------------------------------------------------------
+PART B — app/schemas.py  (Pydantic v2 response/request models)
+-------------------------------------------------------------------------------
+Mirror the orchestrator's assembled `result` dict. Use permissive types where
+the LLM/service output is loosely shaped; the goal is documentation + light
+validation, not rejecting the orchestrator's own output.
+
+    from pydantic import BaseModel, Field
+    from typing import Any, Optional
+
+    class Contributor(BaseModel):
+        factor: str; label: str; impact: float
+        detail: str = ""; severity: str = "low"
+
+    class RiskBreakdown(BaseModel):
+        health_score: int
+        risk_band: str
+        contributors: list[Contributor] = []
+        positives: list[Contributor] = []
+        summary_line: str = ""
+        as_of: Optional[str] = None
+
+    class MLBlock(BaseModel):
+        churn_probability: float
+        band: str
+        top_features: list[dict[str, Any]] = []
+        model_version: str = "unknown"
+
+    class PlaybookBlock(BaseModel):
+        id: Optional[str] = None
+        title: Optional[str] = None
+        text: Optional[str] = None
+        score: Optional[float] = None
+        method: Optional[str] = None
+        low_confidence: Optional[bool] = None
+
+    class AnalysisResult(BaseModel):
+        analysis_id: Optional[int] = None
+        created_at: Optional[str] = None
+        # 7 LLM-contract keys
+        summary: str
+        top_reasons: list[str] = []
+        recommended_action: str
+        priority: str
+        draft_message: str = ""
+        playbook_citation: str = ""
+        generated_by: str = "unknown"
+        # context blocks
+        customer: dict[str, Any]
+        ml: MLBlock
+        risk_breakdown: RiskBreakdown
+        base_action: dict[str, Any]
+        playbook: PlaybookBlock
+        escalate: bool = False
+        method_agreement: dict[str, Any] = {}
+        signals_snapshot: dict[str, Any] = {}
+        status: str = "new"
+
+    class DashboardRow(BaseModel):
+        customer_id: int
+        name: str
+        plan_tier: str
+        arr: float
+        churn_probability: float
+        health_score: int
+        risk_band: str
+        priority: str
+        top_reason: str = ""
+        days_to_renewal: Optional[int] = None
+        last_analysis_at: Optional[str] = None
+        escalate: bool = False
+
+    class CustomerDetail(BaseModel):
+        customer: dict[str, Any]          # from get_signals identity fields
+        signals: dict[str, Any]           # the scored signal values
+        usage_series: list[dict[str, Any]] = []
+        feedback_list: list[dict[str, Any]] = []
+        last_analysis: Optional[AnalysisResult] = None
+
+    class ApproveRequest(BaseModel):
+        analysis_id: Optional[int] = None      # default: latest for customer
+        status: str = Field(pattern="^(approved|edited|dismissed)$")
+        message: str = ""
+
+    class ApproveResponse(BaseModel):
+        analysis_id: int
+        status: str
+        approved_message: str
+
+    class HealthResponse(BaseModel):
+        status: str                        # "ok" | "degraded"
+        components: dict[str, Any]
+
+    Tip: if strict validation fights the orchestrator output during the demo,
+    set `model_config = ConfigDict(extra="allow")` on AnalysisResult and
+    return the raw dict via `AnalysisResult.model_validate(result)`.
+
+
+-------------------------------------------------------------------------------
+PART C — app/routers/customers.py
+-------------------------------------------------------------------------------
+    from fastapi import APIRouter, Depends, HTTPException, Query
+    from app.deps import get_db, require_auth
+    from app.services import orchestrator
+    from app.services import signals as signals_mod
+    from app.services.signals import CustomerNotFound
+    from app import schemas
+
+    router = APIRouter(prefix="/api", tags=["customers"],
+                       dependencies=[Depends(require_auth)])
+
+    @router.get("/customers", response_model=list[schemas.DashboardRow])
+    def list_customers(demo_only: bool = Query(True), db=Depends(get_db)):
+        return orchestrator.list_dashboard_rows(db, demo_only=demo_only)
+        # orchestrator does: cheap ml.predict + scoring per row, use last
+        # analysis if fresh, sort by churn_probability desc, cap 40.
+
+    @router.get("/customers/{cid}", response_model=schemas.CustomerDetail)
+    def get_customer(cid: int, db=Depends(get_db)):
+        try:
+            sig = signals_mod.get_signals(db, cid)
+        except CustomerNotFound:
+            raise HTTPException(404, f"customer {cid} not found")
+        last = orchestrator.get_last_analysis(db, cid)   # dict | None
+        identity = {k: sig[k] for k in ("customer_id","name","plan_tier",
+            "plan_tier_ord","tenure_days","arr","monthly_charges",
+            "renewal_date","days_to_renewal","num_devices","age")}
+        scored = {k: sig[k] for k in ("usage_level","usage_trend_pct",
+            "last_login_days","logins_last_30","active_days_last_30",
+            "payment_failures","support_contacts","open_tickets",
+            "complaint_count","avg_sentiment","last_feedback_sentiment",
+            "engagement_score")}
+        return {"customer": identity, "signals": scored,
+                "usage_series": sig["usage_series"],
+                "feedback_list": sig["feedback_list"],
+                "last_analysis": last}
+
+    NOTE: if list_dashboard_rows currently opens its own session, either give
+    it a `db` param (preferred, testable) or drop the Depends(get_db) here.
+    Keep session handling consistent across the module.
+
+
+-------------------------------------------------------------------------------
+PART D — app/routers/analysis.py
+-------------------------------------------------------------------------------
+    router = APIRouter(prefix="/api", tags=["analysis"],
+                       dependencies=[Depends(require_auth)])
+
+    @router.post("/customers/{cid}/analyze",
+                 response_model=schemas.AnalysisResult)
+    def analyze(cid: int):
+        try:
+            return orchestrator.analyze_customer(cid, force=True)
+        except CustomerNotFound:
+            raise HTTPException(404, f"customer {cid} not found")
+        # orchestrator never raises otherwise (degrades gracefully).
+        # If it somehow does, FastAPI 500 + logged — acceptable.
+
+    @router.post("/customers/{cid}/approve",
+                 response_model=schemas.ApproveResponse)
+    def approve(cid: int, body: schemas.ApproveRequest, db=Depends(get_db)):
+        aid = body.analysis_id
+        if aid is None:
+            last = orchestrator.get_last_analysis(db, cid)
+            if not last: raise HTTPException(404, "no analysis to approve")
+            aid = last["analysis_id"]
+        try:
+            return orchestrator.approve_analysis(db, aid, body.message,
+                                                 body.status)
+        except KeyError:
+            raise HTTPException(404, f"analysis {aid} not found")
+
+    Consider: also allow POST /api/analyses/{aid}/approve — but keeping it
+    under /customers/{cid} is fine for the SPA.
+
+
+-------------------------------------------------------------------------------
+PART E — app/routers/health.py  (optional, ~10 lines, worth it for demo)
+-------------------------------------------------------------------------------
+    @router.get("/health", response_model=schemas.HealthResponse)
+    def health():
+        comps = {}
+        try:
+            from app.services import ml_model
+            comps["ml"] = ml_model.health()
+        except Exception as e:
+            comps["ml"] = {"loaded": False, "error": str(e)}
+        try:
+            from app.services import rag
+            comps["rag"] = rag.backend_info() | {"snippets": rag.corpus_size()}
+        except Exception as e:
+            comps["rag"] = {"error": str(e)}
+        from app.services import llm
+        comps["llm"] = {"enabled": llm.LLM_ENABLED, "model": llm.GEMINI_MODEL}
+        ok = comps["ml"].get("loaded", False)
+        return {"status": "ok" if ok else "degraded", "components": comps}
+
+    Also nice: GET /api/meta -> {reference_date, n_customers, n_demo,
+    demo_ids: [...], churn_rate} read from the `meta` table + a quick query.
+    The SPA can use demo_ids to preselect a critical + healthy customer for
+    the demo.
+
+
+-------------------------------------------------------------------------------
+PART F — app/main.py  (app factory + lifespan + static mount)
+-------------------------------------------------------------------------------
+    import os, logging
+    from contextlib import asynccontextmanager
+    from fastapi import FastAPI
+    from fastapi.middleware.cors import CORSMiddleware
+    from fastapi.staticfiles import StaticFiles
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        logging.basicConfig(level=logging.INFO)
+        from app.db import init_db
+        init_db()                                   # create_all (idempotent)
+        try:
+            from app.services import rag
+            rag.warm()                              # build/load embedding cache
+        except Exception as e:
+            logging.warning("rag.warm failed: %s", e)
+        try:
+            from app.services import ml_model
+            logging.info("ml health: %s", ml_model.health())
+        except Exception as e:
+            logging.error("ml_model not loaded: %s", e)   # fail-soft; /health shows it
+        yield
+
+    def create_app() -> FastAPI:
+        app = FastAPI(title="Churn Risk Agent", version="1.0", lifespan=lifespan)
+
+        origins = os.getenv("CORS_ORIGINS", "*").split(",")
+        app.add_middleware(CORSMiddleware, allow_origins=origins,
+            allow_methods=["*"], allow_headers=["*"], allow_credentials=True)
+
+        from app.routers import customers, analysis, health
+        app.include_router(health.router)     # /api/health, /api/meta
+        app.include_router(customers.router)  # /api/customers...
+        app.include_router(analysis.router)   # /api/customers/{id}/analyze...
+
+        # static SPA (Step 9 puts index.html in frontend/)
+        fe = os.getenv("FRONTEND_DIR", "frontend")
+        if os.path.isdir(fe):
+            app.mount("/", StaticFiles(directory=fe, html=True), name="spa")
+        return app
+
+    app = create_app()
+
+    Run:  uvicorn app.main:app --reload --port 8000
+    Docs: http://localhost:8000/docs  (FastAPI auto Swagger — great for demo)
+
+    ORDER MATTERS: mount StaticFiles at "/" LAST, after routers, or it will
+    shadow /api. (Routers are registered first above — keep it that way.)
+
+
+-------------------------------------------------------------------------------
+PART G — SESSION / THREADING NOTES
+-------------------------------------------------------------------------------
+  - SQLite + FastAPI default sync routes run in a threadpool -> need
+    check_same_thread=False (already in app/db.py) and short-lived sessions
+    per request (get_db dependency). Don't share one Session across requests.
+  - orchestrator.analyze_customer currently opens its own SessionLocal().
+    That's fine (it's a write path). For read routes, prefer the injected
+    `db`. Pick one convention per function and document it.
+  - Long LLM call (~2-6s) blocks a worker thread. For a demo that's OK.
+    If you want snappier: make the analyze route `async def` and run
+    orchestrator in `await run_in_threadpool(...)`. Optional.
+
+
+-------------------------------------------------------------------------------
+PART H — tests/test_api.py  (FastAPI TestClient)
+-------------------------------------------------------------------------------
+    from fastapi.testclient import TestClient
+    from app.main import app
+    client = TestClient(app)          # triggers lifespan (rag.warm, init_db)
+
+Run with LLM_DISABLE=1 + AUTH_DISABLED=1.
+
+  [ ] GET /api/health -> 200, components.ml.loaded True (pkls committed)
+  [ ] GET /api/customers -> 200, list, len <= 40, sorted by
+      churn_probability desc, each row matches DashboardRow schema
+  [ ] GET /api/customers?demo_only=false -> more rows (or all)
+  [ ] GET /api/customers/{critical_id} -> 200, has customer + signals +
+      usage_series (non-empty) + feedback_list; last_analysis may be null
+  [ ] GET /api/customers/999999 -> 404 {"detail": "..."}
+  [ ] POST /api/customers/{critical_id}/analyze -> 200, AnalysisResult,
+      priority in P0..P3, escalate == (priority=="P0"),
+      generated_by == "fallback" (LLM disabled), analysis_id present
+  [ ] second POST analyze -> new analysis_id (history kept)
+  [ ] GET /api/customers/{id} after analyze -> last_analysis populated,
+      matches the POST response's key fields
+  [ ] POST /api/customers/{healthy_id}/analyze -> generated_by
+      "low_risk_shortcut", draft_message ""
+  [ ] POST /api/customers/{id}/approve {status:"approved", message:"ok"}
+      -> 200, status "approved"; GET detail shows status/approved_message
+  [ ] POST approve with status:"garbage" -> 422 (pydantic pattern)
+  [ ] POST /api/customers/999999/analyze -> 404
+  [ ] OpenAPI: GET /openapi.json -> 200 (schemas resolve, no ref errors)
+  [ ] (Step 11 preview) with AUTH_DISABLED=0 and no creds -> 401 on every
+      /api route  (write this test now, mark xfail until Step 11)
+
+
+-------------------------------------------------------------------------------
+PART I — MANUAL SMOKE (do this before declaring Step 8 done)
+-------------------------------------------------------------------------------
+  1. uvicorn app.main:app --reload --port 8000
+  2. open http://localhost:8000/docs
+  3. GET /api/health          -> ml.loaded true, rag backend "ollama",
+                                 llm.enabled true, model gemini-2.5-flash
+  4. GET /api/customers       -> ~40 rows, critical ones on top
+  5. GET /api/customers/{critical_id}
+  6. POST /api/customers/{critical_id}/analyze  (LLM live)
+       -> P0, summary cites playbook, draft_message personalized,
+          latency a few seconds
+  7. POST /api/customers/{healthy_id}/analyze   -> instant, low_risk_shortcut
+  8. POST /api/customers/{critical_id}/approve {status:"edited",
+       message:"<tweaked text>"}  -> 200
+  9. re-GET the customer -> last_analysis.status == "edited"
+  Note the two customer ids used -> reuse in the Step 10 demo script.
+
+
+-------------------------------------------------------------------------------
+PART J — DELIVERABLES CHECKLIST FOR STEP 8
+-------------------------------------------------------------------------------
+  [ ] app/deps.py         get_db + require_auth stub (AUTH_DISABLED gate)
+  [ ] app/schemas.py      all models above; AnalysisResult tolerant of the
+                          orchestrator dict (extra="allow" if needed)
+  [ ] app/routers/customers.py   GET list + GET detail (404 on missing)
+  [ ] app/routers/analysis.py    POST analyze (force=True) + POST approve
+  [ ] app/routers/health.py      GET /api/health (+ /api/meta optional)
+  [ ] app/main.py         create_app, lifespan (init_db, rag.warm,
+                          ml health log), CORS, StaticFiles mounted LAST
+  [ ] orchestrator: add `db` param to list_dashboard_rows /
+      get_last_analysis / approve_analysis if they didn't take one, so
+      routes inject the request session (or keep self-session + document)
+  [ ] tests/test_api.py green (LLM_DISABLE=1, AUTH_DISABLED=1)
+  [ ] manual smoke (Part I) done; 2 demo customer ids recorded
+  [ ] /docs loads and every endpoint is callable from Swagger
+  [ ] .env: add CORS_ORIGINS (default *), FRONTEND_DIR=frontend,
+      AUTH_DISABLED=1 (flip to 0 in Step 11 / prod)
+  [ ] requirements.txt has fastapi + uvicorn[standard] (add if missing)
+  [ ] commit app/main.py app/deps.py app/schemas.py app/routers/* + tests
+
+
+WATCH-OUTS
+  - StaticFiles("/") must be mounted AFTER routers or it eats /api.
+  - Keep routers logic-free: no scoring, no rules, no prompt text.
+  - 404 only for CustomerNotFound / missing analysis. Pipeline degradation
+    is a 200 with generated_by="fallback", NOT an error.
+  - SQLite session per request; check_same_thread=False already set.
+  - Don't rename orchestrator return keys to fit schemas — make schemas
+    match the orchestrator (it's the source of truth). extra="allow" is your
+    friend for the demo.
+  - Auth dependency is wired now (stub); Step 11 only changes its body.
+NEXT: Step 9 — frontend/index.html (single-file SPA: dashboard + customer 360
+      + analyze/approve flow, consuming /api/*).
+===============================================================================

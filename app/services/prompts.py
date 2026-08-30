@@ -68,7 +68,8 @@ TASK:
   4. priority: exactly "{base_action.get('priority')}".
   5. draft_message: 60-120 words, addressed to {signals.get('name')},
      appropriate to a {signals.get('plan_tier')} plan, matching the playbook
-     guidance and channel tone. No placeholders like [NAME].
+     guidance and channel tone. Do NOT use any [NAME] or [Company] placeholders.
+     Sign off with "Your Customer Success Team".
   6. playbook_citation: the playbook title you used.
 If the playbook snippet is low_confidence or its guidance conflicts with the
 REQUIRED action, prefer the REQUIRED action and keep the playbook for tone

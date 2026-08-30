@@ -40,6 +40,9 @@ def load_playbook() -> list[dict]:
     _CORPUS = corpus
     return _CORPUS
 
+def corpus_size() -> int:
+    return len(load_playbook())
+
 def _file_hash(path: str) -> str:
     with open(path, "rb") as f:
         return hashlib.sha1(f.read()).hexdigest()
